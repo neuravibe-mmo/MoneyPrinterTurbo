@@ -87,8 +87,10 @@ st.set_page_config(
 # 也会让新用户误以为需要安装额外组件。这里统一隐藏 Streamlit 平台工具栏，
 # 并压缩主容器顶部留白，只保留项目自己的标题、语言选择和业务设置区域。
 style_file = Path(__file__).with_name("styles.css")
+# Reload styles.css: update bg to #e2e8f0
 streamlit_style = f"<style>{style_file.read_text(encoding='utf-8')}</style>"
 st.markdown(streamlit_style, unsafe_allow_html=True)
+
 # 定义资源目录
 font_dir = os.path.join(root_dir, "resource", "fonts")
 song_dir = os.path.join(root_dir, "resource", "songs")
@@ -4453,8 +4455,7 @@ def _render_local_script_generation(params):
         return
 
     if not params.video_subject:
-        st.toast(tr("Please Enter the Video Subject First"))
-        st.warning(tr("Please Enter the Video Subject First"))
+        st.toast(tr("Please Enter the Video Subject First"), icon="⚠️")
         return
 
     with st.spinner(tr("Generating Video Script and Keywords")):
@@ -4661,8 +4662,7 @@ def _render_loomloom_script_generation(params):
         disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
     ):
         if not params.video_subject:
-            st.toast(tr("Please Enter the Video Subject First"))
-            st.warning(tr("Please Enter the Video Subject First"))
+            st.toast(tr("Please Enter the Video Subject First"), icon="⚠️")
         else:
             try:
                 backend = _create_loomloom_script_backend()
@@ -4966,8 +4966,7 @@ def _render_script_settings(panel, params):
             ):
                 if not params.video_script:
                     # 视频关键词需要基于文案提取，文案为空时提前提示并跳过模型调用。
-                    st.toast(tr("Please Enter the Video Subject"))
-                    st.warning(tr("Please Enter the Video Subject"))
+                    st.toast(tr("Please Enter the Video Subject"), icon="⚠️")
                 else:
                     with st.spinner(tr("Generating Video Keywords")):
                         terms = _run_llm_read_operation(
@@ -6873,6 +6872,34 @@ def _render_audio_settings(panel, params):
                         display_name.replace("Female", tr("Female"))
                         .replace("Male", tr("Male"))
                     )
+                if voice.is_mimo_voice(v):
+                    mimo_raw = v.removeprefix("mimo:")
+                    parts = mimo_raw.rsplit("-", 1)
+                    raw_name = parts[0]
+                    gender = parts[1] if len(parts) > 1 else ""
+                    gender_str = f" - {tr(gender)}" if gender else ""
+                    ui_lang = st.session_state.get("ui_language", "en")
+                    if ui_lang == "vi":
+                        mimo_vi = {
+                            "mimo_default": "Mặc định",
+                            "冰糖": "Băng Đường (Rock Candy)",
+                            "茉莉": "Hoa Nhài (Jasmine)",
+                            "苏打": "Soda",
+                            "白桦": "Bạch Hoa (Birch)",
+                        }
+                        display_name = mimo_vi.get(raw_name, raw_name)
+                    elif ui_lang != "zh":
+                        mimo_en = {
+                            "mimo_default": "Default",
+                            "冰糖": "Rock Candy",
+                            "茉莉": "Jasmine",
+                            "苏打": "Soda",
+                            "白桦": "Birch",
+                        }
+                        display_name = mimo_en.get(raw_name, raw_name)
+                    else:
+                        display_name = raw_name
+                    return f"mimo: {display_name}{gender_str}"
                 if voice.is_voxcpm_voice(v):
                     return v.split(":", 1)[1] or DEFAULT_VOXCPM_VOICE
                 return (

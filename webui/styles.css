@@ -497,22 +497,55 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
    Dropdown / Selectbox Popover Contrast & Elevation Enhancements
    ============================================================================= */
 
-/* 1. Khung hộp chọn (Trạng thái đóng / Chưa mở menu) */
-div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div,
+/* 1. Khung hộp chọn (Trạng thái đóng / Chưa mở menu) - Nền trắng tinh khôi, viền đậm rõ nét */
+div[data-testid="stSelectbox"] [data-baseweb="select"],
 div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
-div[data-testid="stSelectbox"] input {
-    font-weight: 500 !important;
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div > div,
+div[data-testid="stSelectbox"] [data-baseweb="select"] div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"],
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div > div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] div {
+    background-color: #ffffff !important;
 }
 
-div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div {
-    border: 1px solid #cbd5e1 !important;
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+    border: 1.5px solid #64748b !important;
     border-radius: 0.5rem !important;
-    background-color: var(--st-secondary-background-color) !important;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+    background-color: #ffffff !important;
+    box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.08) !important;
+    transition: all 0.15s ease !important;
 }
 
-div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div:hover {
-    border-color: #94a3b8 !important;
+div[data-testid="stSelectbox"] [data-baseweb="select"] div,
+div[data-testid="stSelectbox"] [data-baseweb="select"] span,
+div[data-testid="stSelectbox"] input,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] span {
+    color: #0f172a !important;
+    font-weight: 600 !important;
+}
+
+/* Biểu tượng mũi tên dropdown màu đậm rõ ràng */
+div[data-testid="stSelectbox"] [data-baseweb="select"] svg,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] svg {
+    color: #1e293b !important;
+    fill: #1e293b !important;
+    stroke: #1e293b !important;
+}
+
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div:hover,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover {
+    border-color: #1e293b !important;
+    box-shadow: 0 2px 6px 0 rgba(15, 23, 42, 0.15) !important;
+}
+
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div:focus-within,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within {
+    border-color: #ff4b4b !important;
+    box-shadow: 0 0 0 2px rgba(255, 75, 75, 0.25) !important;
+    background-color: #ffffff !important;
 }
 
 /* 2. Menu Popover thả xuống: Nổi bật hoàn toàn khỏi nền card với viền sắc nét và đổ bóng 3D */
@@ -584,12 +617,20 @@ div[data-baseweb="popover"] li[role="option"][aria-selected="true"] * {
 
 /* 7. Chế độ nền tối (Dark Mode): Tương phản cao chuyên biệt */
 @media (prefers-color-scheme: dark) {
-    div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div {
+    div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+    div[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
         border-color: rgba(255, 255, 255, 0.22) !important;
     }
 
-    div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div:hover {
+    div[data-testid="stSelectbox"] [data-baseweb="select"] > div:hover,
+    div[data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover {
         border-color: rgba(255, 255, 255, 0.45) !important;
+    }
+
+    div[data-testid="stSelectbox"] [data-baseweb="select"] > div:focus-within,
+    div[data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within {
+        border-color: #ff4b4b !important;
+        box-shadow: 0 0 0 1px #ff4b4b !important;
     }
 
     div[data-testid="stSelectboxVirtualDropdown"],
@@ -703,4 +744,182 @@ div[class*="st-key-preview_final_script_prompt"] button p {
     text-overflow: ellipsis !important;
     word-break: break-word !important;
 }
+
+/* ==========================================================================
+   Toast Notification Styling (High Contrast & Modern Design)
+   ========================================================================== */
+div[data-testid="stToast"] {
+    background-color: #1e293b !important;
+    color: #f8fafc !important;
+    border: 1px solid #334155 !important;
+    border-radius: 0.65rem !important;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.35), 0 8px 10px -6px rgba(0, 0, 0, 0.25) !important;
+    padding: 0.75rem 1rem !important;
+    min-width: 280px !important;
+}
+
+div[data-testid="stToast"] [data-testid="stMarkdownContainer"] p {
+    color: #f8fafc !important;
+    font-size: 0.925rem !important;
+    font-weight: 500 !important;
+    line-height: 1.4 !important;
+}
+
+div[data-testid="stToast"] button {
+    color: #94a3b8 !important;
+    background: transparent !important;
+    border: none !important;
+    transition: color 0.15s ease !important;
+}
+
+div[data-testid="stToast"] button:hover {
+    color: #ffffff !important;
+}
+
+div[data-testid="stToast"] button svg {
+    fill: currentColor !important;
+    stroke: currentColor !important;
+}
+
+/* ==========================================================================
+   Clean & High-Contrast Modern Theme (Cards, Inputs, Buttons & Headers)
+   ========================================================================== */
+
+/* 1. Nền trang và 4 Cột Card chức năng */
+.stApp,
+[data-testid="stAppViewContainer"],
+section.main {
+    background-color: #e2e8f0 !important;
+}
+
+div[data-testid="stColumn"] > div[data-testid="stVerticalBlockBorderWrapper"],
+div[data-testid="stColumn"] [data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: #ffffff !important;
+    border: 1.5px solid #94a3b8 !important;
+    border-radius: 0.75rem !important;
+    box-shadow: 0 4px 14px -2px rgba(15, 23, 42, 0.12), 0 2px 6px -1px rgba(15, 23, 42, 0.08) !important;
+    padding: 0.4rem 0.25rem !important;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease !important;
+}
+
+div[data-testid="stColumn"] > div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+    box-shadow: 0 8px 24px -4px rgba(15, 23, 42, 0.18) !important;
+    border-color: #64748b !important;
+}
+
+/* 2. Tiêu đề nổi bật cho 4 Card */
+div[data-testid="stColumn"] [data-testid="stMarkdownContainer"] > p > strong:first-child {
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
+    color: #0f172a !important;
+    letter-spacing: -0.01em !important;
+    display: inline-block !important;
+    margin-bottom: 0.25rem !important;
+}
+
+/* 3. Ô nhập liệu Textarea và TextInput đồng bộ viền 1.5px & nền trắng tinh */
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stTextInput"] input {
+    border: 1.5px solid #94a3b8 !important;
+    border-radius: 0.5rem !important;
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    font-weight: 500 !important;
+    box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.08) !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease !important;
+}
+
+div[data-testid="stTextArea"] textarea:hover,
+div[data-testid="stTextInput"] input:hover {
+    border-color: #475569 !important;
+    box-shadow: 0 2px 6px 0 rgba(15, 23, 42, 0.12) !important;
+}
+
+div[data-testid="stTextArea"] textarea:focus,
+div[data-testid="stTextInput"] input:focus {
+    border-color: #ff4b4b !important;
+    box-shadow: 0 0 0 2px rgba(255, 75, 75, 0.25) !important;
+    background-color: #ffffff !important;
+    outline: none !important;
+}
+
+/* 4. Các nút bấm chức năng (Secondary Buttons) sắc nét & dễ nhìn */
+button[kind="secondary"] {
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 0.5rem !important;
+    background-color: #ffffff !important;
+    color: #1e293b !important;
+    font-weight: 550 !important;
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+    transition: all 0.15s ease !important;
+}
+
+button[kind="secondary"]:hover {
+    border-color: #94a3b8 !important;
+    background-color: #f8fafc !important;
+    color: #0f172a !important;
+    box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.08) !important;
+}
+
+/* 5. Khung mở rộng Expander */
+div[data-testid="stExpander"] {
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 0.5rem !important;
+    background-color: var(--st-secondary-background-color, #f8fafc) !important;
+    overflow: hidden !important;
+}
+
+div[data-testid="stExpander"] summary {
+    font-weight: 550 !important;
+    color: #334155 !important;
+}
+
+/* 6. Hỗ trợ Chế độ nền tối (Dark Mode) cho Theme */
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stColumn"] > div[data-testid="stVerticalBlockBorderWrapper"],
+    div[data-testid="stColumn"] [data-testid="stVerticalBlockBorderWrapper"] {
+        background-color: #181c24 !important;
+        border-color: rgba(255, 255, 255, 0.15) !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+    }
+
+    div[data-testid="stColumn"] [data-testid="stMarkdownContainer"] > p > strong:first-child {
+        color: #f8fafc !important;
+    }
+
+    div[data-testid="stTextArea"] textarea,
+    div[data-testid="stTextInput"] input {
+        border-color: rgba(255, 255, 255, 0.2) !important;
+        background-color: rgba(255, 255, 255, 0.05) !important;
+        color: #f8fafc !important;
+    }
+
+    div[data-testid="stTextArea"] textarea:hover,
+    div[data-testid="stTextInput"] input:hover {
+        border-color: rgba(255, 255, 255, 0.4) !important;
+        background-color: rgba(255, 255, 255, 0.08) !important;
+    }
+
+    button[kind="secondary"] {
+        border-color: rgba(255, 255, 255, 0.2) !important;
+        background-color: #1e222a !important;
+        color: #f8fafc !important;
+    }
+
+    button[kind="secondary"]:hover {
+        border-color: rgba(255, 255, 255, 0.4) !important;
+        background-color: #262c36 !important;
+    }
+
+    div[data-testid="stExpander"] {
+        border-color: rgba(255, 255, 255, 0.15) !important;
+        background-color: rgba(255, 255, 255, 0.03) !important;
+    }
+
+    div[data-testid="stExpander"] summary {
+        color: #cbd5e1 !important;
+    }
+}
+
+
 
