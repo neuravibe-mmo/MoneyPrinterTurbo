@@ -1727,35 +1727,7 @@ def _open_material_settings_dialog():
 
 def _render_brand(available_update: str | None = None):
     """渲染项目名称、当前版本和可选的更新入口。"""
-    update_link = ""
-    if available_update:
-        update_label = html.escape(
-            tr("Update Available").format(version=available_update)
-        )
-        # Streamlit 会继续用 Markdown 解析传入的 HTML。这里保持链接为单行，
-        # 避免多行字符串的缩进被识别成代码块，导致页面直接显示 HTML 源码。
-        update_link = (
-            '<a class="mpt-brand__update" '
-            f'href="{version_checker.LATEST_RELEASE_PAGE_URL}" '
-            'target="_blank" rel="noopener noreferrer" '
-            f'aria-label="{update_label}" title="{update_label}">'
-            f"{update_label}</a>"
-        )
-    st.markdown(
-        f"""
-        <h1 class="mpt-brand">
-            <span class="mpt-brand__name">MoneyPrinterTurbo</span>
-            <a class="mpt-brand__version"
-               href="https://github.com/harry0703/MoneyPrinterTurbo"
-               target="_blank"
-               rel="noopener noreferrer"
-               aria-label="Open MoneyPrinterTurbo on GitHub"
-               title="Open project on GitHub">v{html.escape(str(config.project_version))}</a>
-            {update_link}
-        </h1>
-        """,
-        unsafe_allow_html=True,
-    )
+    pass
 
 
 @st.fragment(run_every="1s")
@@ -2315,151 +2287,6 @@ def stable_selectbox(label, options, default_value, key, format_func=None, **kwa
     )
 
 
-# Streamlit 原生 selectbox 暂不支持 HTML optgroup。这里使用 1.59 自带的
-# Components v2 封装原生 <select>/<optgroup>，无需引入前端依赖，同时保留浏览器
-# 原生的键盘导航、无障碍语义和移动端选择体验。组件只传递固定业务值和翻译文本，
-# 不接收任意 HTML，从边界上避免配置内容进入 innerHTML。
-_GROUPED_SELECT_COMPONENT = st.components.v2.component(
-    "mpt_grouped_select",
-    html="""
-        <div class="mpt-grouped-select">
-            <div class="mpt-grouped-select__label-row">
-                <label class="mpt-grouped-select__label"></label>
-                <button class="mpt-grouped-select__settings" type="button"></button>
-            </div>
-            <div class="mpt-grouped-select__control">
-                <select></select>
-            </div>
-        </div>
-    """,
-    css="""
-        .mpt-grouped-select {
-            width: 100%;
-            color: var(--st-text-color);
-            font-family: var(--st-font);
-        }
-
-        .mpt-grouped-select__label-row {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: baseline;
-            gap: 0.45rem;
-            margin-bottom: 0.35rem;
-        }
-
-        .mpt-grouped-select__label {
-            font-size: 0.875rem;
-            line-height: 1.25rem;
-        }
-
-        .mpt-grouped-select__settings {
-            padding: 0;
-            border: 0;
-            background: transparent;
-            color: var(--st-link-color);
-            font: inherit;
-            font-size: 0.8rem;
-            line-height: 1.25rem;
-            cursor: pointer;
-        }
-
-        .mpt-grouped-select__settings:hover {
-            text-decoration: underline;
-            text-underline-offset: 0.15rem;
-        }
-
-        .mpt-grouped-select__settings:focus-visible {
-            border-radius: 0.2rem;
-            outline: 2px solid var(--st-primary-color);
-            outline-offset: 2px;
-        }
-
-        .mpt-grouped-select__control {
-            position: relative;
-        }
-
-        .mpt-grouped-select__control::after {
-            position: absolute;
-            top: 50%;
-            right: 1rem;
-            width: 0.55rem;
-            height: 0.55rem;
-            border-right: 2px solid currentColor;
-            border-bottom: 2px solid currentColor;
-            content: "";
-            pointer-events: none;
-            transform: translateY(-70%) rotate(45deg);
-        }
-
-        .mpt-grouped-select select {
-            width: 100%;
-            min-height: 2.5rem;
-            padding: 0.45rem 2.75rem 0.45rem 0.75rem;
-            border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
-            border-radius: 0.5rem;
-            outline: none;
-            appearance: none;
-            background: var(--st-secondary-background-color);
-            color: inherit;
-            font: inherit;
-            cursor: pointer;
-        }
-
-        .mpt-grouped-select select:hover {
-            border-color: color-mix(in srgb, currentColor 36%, transparent);
-        }
-
-        .mpt-grouped-select select:focus-visible {
-            border-color: var(--st-primary-color);
-            box-shadow: 0 0 0 1px var(--st-primary-color);
-        }
-    """,
-    js="""
-        export default function(component) {
-            const { data, parentElement, setTriggerValue } = component;
-            const label = parentElement.querySelector("label");
-            const settings = parentElement.querySelector(".mpt-grouped-select__settings");
-            const select = parentElement.querySelector("select");
-
-            label.textContent = data.label;
-            settings.textContent = data.settingsLabel;
-            settings.hidden = !data.settingsLabel;
-            select.id = data.controlId;
-            label.htmlFor = data.controlId;
-            select.setAttribute("aria-label", data.label);
-            select.replaceChildren();
-
-            for (const groupData of data.groups) {
-                const group = document.createElement("optgroup");
-                group.label = groupData.label;
-                for (const optionData of groupData.options) {
-                    const option = document.createElement("option");
-                    option.value = optionData.value;
-                    option.textContent = optionData.label;
-                    group.appendChild(option);
-                }
-                select.appendChild(group);
-            }
-
-            select.value = data.value;
-            const handleChange = () => {
-                setTriggerValue("selected", select.value);
-            };
-            const handleSettings = () => {
-                setTriggerValue("settings", true);
-            };
-            select.addEventListener("change", handleChange);
-            settings.addEventListener("click", handleSettings);
-
-            return () => {
-                select.removeEventListener("change", handleChange);
-                settings.removeEventListener("click", handleSettings);
-            };
-        }
-    """,
-)
-
-
 def grouped_selectbox(
     label,
     groups,
@@ -2469,23 +2296,16 @@ def grouped_selectbox(
     settings_label="",
     on_settings=None,
 ):
-    """渲染带不可选分组标题的单个下拉框，并返回稳定业务值。"""
+    """渲染带分组标识的单个下拉框，与页面其它 Streamlit selectbox 保持统一主题。"""
     if format_func is None:
         format_func = str
 
-    normalized_groups = []
+    option_to_group = {}
     valid_values = []
     for group_label, options in groups:
-        normalized_options = []
         for option in options:
             valid_values.append(option)
-            normalized_options.append(
-                {"value": option, "label": str(format_func(option))}
-            )
-        if normalized_options:
-            normalized_groups.append(
-                {"label": str(group_label), "options": normalized_options}
-            )
+            option_to_group[option] = str(group_label)
 
     if not valid_values:
         raise ValueError(f"grouped selectbox options cannot be empty: {key}")
@@ -2494,40 +2314,49 @@ def grouped_selectbox(
     if default_value not in valid_values:
         default_value = valid_values[0]
 
-    # 业务选择保存在与旧 selectbox 相同的 session key 中，设置预设恢复和
-    # 语言切换逻辑无需分叉；组件自身使用独立 key，避免与业务状态冲突。
-    widget_key = localized_widget_key(key)
-    if widget_key not in st.session_state:
-        st.session_state[widget_key] = default_value
-    selected_value = st.session_state[widget_key]
-    if selected_value not in valid_values:
-        selected_value = default_value
-        st.session_state[widget_key] = selected_value
+    def display_func(option):
+        item_label = str(format_func(option))
+        group = option_to_group.get(option)
+        if group:
+            if group.strip().lower() == item_label.strip().lower():
+                return f"[{group}]"
+            return f"[{group}] {item_label}"
+        return item_label
 
-    result = _GROUPED_SELECT_COMPONENT(
-        key=f"{widget_key}_component",
-        data={
-            "label": label,
-            "settingsLabel": settings_label,
-            # 显式关联可见 label 与原生 select。组件 key 由固定业务名称和
-            # 语言代码组成，在页面内唯一，既方便鼠标点击标签聚焦控件，
-            # 也不会引入随机 ID 导致每次 rerun 都重建前端状态。
-            "controlId": f"{widget_key}_control",
-            "value": selected_value,
-            "groups": normalized_groups,
-        },
-        on_selected_change=lambda: None,
-        on_settings_change=on_settings or (lambda: None),
+    if settings_label and on_settings:
+        with st.container(key=f"{key}_field"):
+            with st.container(
+                key=f"{key}_label_row",
+                horizontal=True,
+                vertical_alignment="center",
+                gap="small",
+            ):
+                st.markdown(
+                    label,
+                    width="content",
+                )
+                st.button(
+                    settings_label,
+                    key=f"open_settings_from_{key}",
+                    type="tertiary",
+                    on_click=on_settings,
+                )
+            return stable_selectbox(
+                label,
+                options=valid_values,
+                default_value=default_value,
+                key=key,
+                format_func=display_func,
+                label_visibility="collapsed",
+            )
+
+    return stable_selectbox(
+        label,
+        options=valid_values,
+        default_value=default_value,
+        key=key,
+        format_func=display_func,
     )
-    changed_value = getattr(result, "selected", None)
-    if changed_value in valid_values and changed_value != selected_value:
-        st.session_state[widget_key] = changed_value
-        # Components v2 在当前脚本轮次返回事件时，本轮传给前端的 data 仍是
-        # 事件发生前的旧值。立即自动 rerun，让组件和依赖 video_source 的控件
-        # 同时收到新值；否则下拉框会被旧 data 短暂覆盖，用户只能再选一次。
-        st.rerun()
-
-    return selected_value
 
 
 def sync_script_order_concat_mode():
@@ -5089,30 +4918,31 @@ def _render_script_settings(panel, params):
                         "ui", "custom_system_prompt", params.custom_system_prompt
                     )
 
-                    restore_prompt_col, preview_prompt_col = st.columns(2)
-                    if restore_prompt_col.button(
-                        tr("Restore Default System Prompt"),
-                        key="restore_default_system_prompt",
-                        icon=":material/restart_alt:",
-                        on_click=reset_script_system_prompt,
-                        use_container_width=True,
-                    ):
-                        st.toast(tr("Default System Prompt Restored"))
-                    if preview_prompt_col.button(
-                        tr("Preview Final Prompt"),
-                        key="preview_final_script_prompt",
-                        icon=":material/preview:",
-                        use_container_width=True,
-                    ):
-                        render_script_prompt_preview(
-                            llm.build_script_prompt(
-                                video_subject=params.video_subject,
-                                language=params.video_language,
-                                paragraph_number=params.paragraph_number,
-                                video_script_prompt=params.video_script_prompt,
-                                custom_system_prompt=params.custom_system_prompt,
+                    with st.container(key="system_prompt_actions_row"):
+                        restore_prompt_col, preview_prompt_col = st.columns(2)
+                        if restore_prompt_col.button(
+                            tr("Restore Default System Prompt"),
+                            key="restore_default_system_prompt",
+                            icon=":material/restart_alt:",
+                            on_click=reset_script_system_prompt,
+                            use_container_width=True,
+                        ):
+                            st.toast(tr("Default System Prompt Restored"))
+                        if preview_prompt_col.button(
+                            tr("Preview Final Prompt"),
+                            key="preview_final_script_prompt",
+                            icon=":material/preview:",
+                            use_container_width=True,
+                        ):
+                            render_script_prompt_preview(
+                                llm.build_script_prompt(
+                                    video_subject=params.video_subject,
+                                    language=params.video_language,
+                                    paragraph_number=params.paragraph_number,
+                                    video_script_prompt=params.video_script_prompt,
+                                    custom_system_prompt=params.custom_system_prompt,
+                                )
                             )
-                        )
 
             # 模型发现只增强视频素材，不改变用户明确选择的文案 Provider。
             if _effective_script_generation_backend() == "loomloom":

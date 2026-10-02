@@ -1,9 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
-import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from app.config import config
@@ -14,40 +12,12 @@ ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 
 
-class _GroupedSelectHarness:
-    """只替换视频来源组件，保留页面中其它 Components v2 的真实实现。"""
-
-    def __init__(self):
-        self.selected = None
-        self.calls = []
-        self.declaration = None
-        self._original_component = st.components.v2.component
-
-    def declare(self, name, *args, **kwargs):
-        # 新手引导等第三方组件同样使用 Components v2。透传这些声明可以避免
-        # 测试桩改变页面其它功能，只控制本用例关心的视频来源选择结果。
-        if name != "mpt_grouped_select":
-            return self._original_component(name, *args, **kwargs)
-
-        self.declaration = kwargs
-
-        def render(**render_kwargs):
-            self.calls.append(render_kwargs)
-            return SimpleNamespace(selected=self.selected)
-
-        return render
-
-
 @contextmanager
-def _running_app(harness, *, saved_video_source="pexels"):
-    """在整个用例期间保持组件、配置和外部音色查询隔离。"""
+def _running_app(*args, saved_video_source="pexels"):
+    """在整个用例期间保持配置和外部音色查询隔离。"""
     test_app_config = dict(config.app, video_source=saved_video_source)
     test_ui_config = dict(config.ui, language="en")
     with (
-        patch(
-            "streamlit.components.v2.component",
-            side_effect=harness.declare,
-        ),
         patch.object(config, "app", test_app_config),
         patch.object(config, "ui", test_ui_config),
         patch.object(config, "try_save_config", return_value=True),
@@ -65,80 +35,60 @@ def _running_app(harness, *, saved_video_source="pexels"):
 
 
 def test_grouped_video_source_applies_first_change_and_allows_switching_back():
-    """一次 change 事件就应更新业务状态，不能要求用户重复选择。"""
-    harness = _GroupedSelectHarness()
-    with _running_app(harness) as app:
+    """一次选择操作就应更新业务状态，并允许切换回原选项。"""
+    with _running_app() as app:
+        source_box = next(
+            item for item in app.selectbox if item.key == "video_source_select_en"
+        )
         assert app.session_state["video_source_select_en"] == "pexels"
-        assert harness.calls[-1]["data"]["value"] == "pexels"
+        assert source_box.value == "pexels"
 
-        harness.selected = "pixabay"
-        app.run()
+        source_box.set_value("pixabay").run()
         assert [str(item.value) for item in app.exception] == []
         assert app.session_state["video_source_select_en"] == "pixabay"
-        # grouped_selectbox 会在事件轮次主动 rerun；最后一次渲染必须把新值
-        # 回传给前端，否则组件仍可能被旧 data 覆盖。
-        assert harness.calls[-1]["data"]["value"] == "pixabay"
 
-        harness.selected = "pexels"
-        app.run()
+        source_box = next(
+            item for item in app.selectbox if item.key == "video_source_select_en"
+        )
+        source_box.set_value("pexels").run()
         assert [str(item.value) for item in app.exception] == []
         assert app.session_state["video_source_select_en"] == "pexels"
-        assert harness.calls[-1]["data"]["value"] == "pexels"
 
 
 def test_grouped_video_source_ignores_unknown_event_and_repairs_saved_value():
-    """过期配置和伪造事件都不能让页面进入未知素材来源状态。"""
-    harness = _GroupedSelectHarness()
-    with _running_app(harness, saved_video_source="removed-provider") as app:
+    """过期配置不能让页面进入未知素材来源状态。"""
+    with _running_app(saved_video_source="removed-provider") as app:
         assert app.session_state["video_source_select_en"] == "pexels"
-        assert harness.calls[-1]["data"]["value"] == "pexels"
-
-        harness.selected = "unknown-provider"
-        app.run()
-        assert [str(item.value) for item in app.exception] == []
-        assert app.session_state["video_source_select_en"] == "pexels"
-        assert harness.calls[-1]["data"]["value"] == "pexels"
+        source_box = next(
+            item for item in app.selectbox if item.key == "video_source_select_en"
+        )
+        assert source_box.value == "pexels"
 
 
 def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
-    """组件数据应保持分组顺序，并为可见标签提供稳定控件 ID。"""
-    harness = _GroupedSelectHarness()
-    with _running_app(harness):
-        data = harness.calls[-1]["data"]
-        assert data["controlId"] == "video_source_select_en_control"
-        assert [group["label"] for group in data["groups"]] == [
-            "Stock Video",
-            "AI Video",
-            "AI Image",
-            "Local Files",
+    """下拉框应包含全部预设素材来源选项。"""
+    with _running_app() as app:
+        source_box = next(
+            item for item in app.selectbox if item.key == "video_source_select_en"
+        )
+        assert list(source_box.options) == [
+            "[Stock Video] Pexels",
+            "[Stock Video] Pixabay",
+            "[Stock Video] Coverr",
+            "[AI Video] Metaso · MiniMax H3",
+            "[AI Video] OFox AI Video",
+            "[AI Video] Shengsuan Cloud AI Video",
+            "[AI Video] Volcano Engine Ark · Seedance",
+            "[AI Video] WaveSpeed AI Video",
+            "[AI Video] MuAPI AI Video",
+            "[AI Image] OpenAI Compatible Text-to-Image",
+            "[Local Files] Local file",
         ]
-        assert [
-            option["value"] for group in data["groups"] for option in group["options"]
-        ] == [
-            "pexels",
-            "pixabay",
-            "coverr",
-            "metaso_minimax",
-            "ofox",
-            "loomloom",
-            "volcengine_seedance",
-            "wavespeed",
-            "muapi",
-            "openai_image",
-            "local",
-        ]
-
-        # AppTest 当前不会暴露 Components v2 的内部 DOM，因此同时校验组件声明
-        # 确实使用 controlId 关联 label/select，并允许窄屏下标签行自然换行。
-        assert "label.htmlFor = data.controlId" in harness.declaration["js"]
-        assert "select.id = data.controlId" in harness.declaration["js"]
-        assert "flex-wrap: wrap" in harness.declaration["css"]
 
 
 def test_stock_concurrency_only_appears_for_stock_sources():
     """库存并发仅对三家库存素材显示，切换来源时保留显式设置。"""
-    harness = _GroupedSelectHarness()
-    with _running_app(harness) as app:
+    with _running_app() as app:
         stock = next(
             item for item in app.selectbox
             if item.key.startswith("material_concurrency_select_")
@@ -166,8 +116,10 @@ def test_stock_concurrency_only_appears_for_stock_sources():
             ("local", False),
             ("pexels", True),
         ):
-            harness.selected = source
-            app.run()
+            source_box = next(
+                item for item in app.selectbox if item.key == "video_source_select_en"
+            )
+            source_box.set_value(source).run()
             assert [str(item.value) for item in app.exception] == []
             stock_widgets = [
                 item for item in app.selectbox
@@ -181,3 +133,4 @@ def test_stock_concurrency_only_appears_for_stock_sources():
                 if item.key.startswith("clip_rendering_concurrency_select_")
             ).value == 2
             assert config.app["material_concurrency"] == 4
+

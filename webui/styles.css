@@ -28,25 +28,30 @@ label[data-testid="stWidgetLabel"] > div {
 /* 视频主题与大模型存在直接依赖，把配置入口放在字段标签旁。这里将 tertiary
    button 收敛为普通文字链接，避免它与下方“生成文案”主操作争夺视觉层级；
    text_area 仍保留折叠 label，因此屏幕阅读器可以继续读取字段名称。 */
-div[class*="st-key-video_subject_label_row"] {
+div[class*="st-key-video_subject_label_row"],
+div[class*="st-key-video_source_select_label_row"] {
     align-items: baseline !important;
     gap: 0.45rem !important;
 }
 
-/* 自定义标签行和 text_area 是同一字段的两个子元素。覆盖 Streamlit 容器默认
+/* 自定义标签行和输入控件是同一字段的两个子元素。覆盖 Streamlit 容器默认
    的纵向大间距，使它与原生“标签 + 输入框”控件保持相同的视觉节奏。 */
-div[class*="st-key-video_subject_field"] {
+div[class*="st-key-video_subject_field"],
+div[class*="st-key-video_source_select_field"] {
     gap: 0.35rem !important;
 }
 
 div[class*="st-key-video_subject_label_row"]
+    [data-testid="stMarkdownContainer"] p,
+div[class*="st-key-video_source_select_label_row"]
     [data-testid="stMarkdownContainer"] p {
     margin: 0 !important;
     font-size: 0.875rem !important;
     line-height: 1.25rem !important;
 }
 
-div[class*="st-key-video_subject_label_row"] button {
+div[class*="st-key-video_subject_label_row"] button,
+div[class*="st-key-video_source_select_label_row"] button {
     min-height: 0 !important;
     height: auto !important;
     padding: 0 !important;
@@ -57,14 +62,16 @@ div[class*="st-key-video_subject_label_row"] button {
     line-height: 1.25rem !important;
 }
 
-div[class*="st-key-video_subject_label_row"] button p {
+div[class*="st-key-video_subject_label_row"] button p,
+div[class*="st-key-video_source_select_label_row"] button p {
     margin: 0 !important;
     color: var(--st-link-color, #0068c9) !important;
     font-size: 0.8rem !important;
     line-height: 1.25rem !important;
 }
 
-div[class*="st-key-video_subject_label_row"] button:hover {
+div[class*="st-key-video_subject_label_row"] button:hover,
+div[class*="st-key-video_source_select_label_row"] button:hover {
     background: transparent !important;
     text-decoration: underline !important;
     text-underline-offset: 0.15rem;
@@ -94,6 +101,7 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
 /* 顶部品牌区将项目名和弱化版本号放在同一基线。项目名称仍是页面唯一的 h1；
    版本号本身作为项目链接，避免增加独立图标而干扰标题的视觉层级。 */
 .mpt-brand {
+    display: none !important;
     min-width: 0;
     margin: 0;
     padding: 0;
@@ -484,3 +492,215 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
         min-width: 1.75rem !important;
     }
 }
+
+/* =============================================================================
+   Dropdown / Selectbox Popover Contrast & Elevation Enhancements
+   ============================================================================= */
+
+/* 1. Khung hộp chọn (Trạng thái đóng / Chưa mở menu) */
+div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div,
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+div[data-testid="stSelectbox"] input {
+    font-weight: 500 !important;
+}
+
+div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div {
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 0.5rem !important;
+    background-color: var(--st-secondary-background-color) !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+}
+
+div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div:hover {
+    border-color: #94a3b8 !important;
+}
+
+/* 2. Menu Popover thả xuống: Nổi bật hoàn toàn khỏi nền card với viền sắc nét và đổ bóng 3D */
+div[data-testid="stSelectboxVirtualDropdown"],
+div[data-baseweb="popover"] {
+    border-radius: 0.65rem !important;
+    background-color: #ffffff !important;
+    border: 1.5px solid #cbd5e1 !important;
+    box-shadow: 0 14px 34px -4px rgba(15, 23, 42, 0.22),
+                0 6px 14px -2px rgba(15, 23, 42, 0.12),
+                0 0 0 1px rgba(15, 23, 42, 0.06) !important;
+    overflow: hidden !important;
+    z-index: 999999 !important;
+}
+
+/* 3. Danh sách bên trong (Listbox/Menu) */
+div[data-testid="stSelectboxVirtualDropdown"] ul,
+div[data-testid="stSelectboxVirtualDropdown"] [role="listbox"],
+div[data-baseweb="popover"] [data-baseweb="menu"],
+div[data-baseweb="popover"] ul[role="listbox"] {
+    background-color: #ffffff !important;
+    padding: 0.35rem !important;
+}
+
+/* 4. Từng dòng lựa chọn (Option Item): Chữ đen nét, padding thoải mái */
+div[data-testid="stSelectboxVirtualDropdown"] [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] [role="option"],
+div[data-testid="stSelectboxVirtualDropdown"] li,
+div[data-baseweb="popover"] li[role="option"],
+div[data-baseweb="popover"] li[data-baseweb="menu-item"] {
+    font-size: 0.875rem !important;
+    font-weight: 500 !important;
+    color: #0f172a !important;
+    border-radius: 0.45rem !important;
+    transition: background-color 0.1s ease, color 0.1s ease !important;
+    cursor: pointer !important;
+    line-height: 1.4 !important;
+}
+
+/* 5. Trạng thái Hover / Focus: Nổi bật rõ ràng khi rê chuột */
+div[data-testid="stSelectboxVirtualDropdown"] [data-hovered] [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] [data-focused] [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] li:hover [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] li:hover,
+div[data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover,
+div[data-baseweb="popover"] li[role="option"]:hover,
+div[data-baseweb="popover"] li[data-baseweb="menu-item"]:hover {
+    background-color: #f1f5f9 !important;
+    color: #0f172a !important;
+    font-weight: 600 !important;
+}
+
+/* 6. Mục đang được chọn (Selected option): Tone màu thương hiệu Streamlit / Accent nổi bật */
+div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] [data-selected] [data-item-hl],
+div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"],
+div[data-testid="stSelectboxVirtualDropdown"] [data-selected],
+div[data-baseweb="popover"] li[role="option"][aria-selected="true"],
+div[data-baseweb="popover"] li[data-baseweb="menu-item"][aria-selected="true"] {
+    background-color: rgba(255, 75, 75, 0.12) !important;
+    color: #d93838 !important;
+    font-weight: 600 !important;
+}
+
+div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] [data-item-hl] *,
+div[data-baseweb="popover"] li[role="option"][aria-selected="true"] * {
+    color: #d93838 !important;
+}
+
+/* 7. Chế độ nền tối (Dark Mode): Tương phản cao chuyên biệt */
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div {
+        border-color: rgba(255, 255, 255, 0.22) !important;
+    }
+
+    div[data-testid="stSelectbox"] > div[data-testid="stWidgetLabel"] + div:hover {
+        border-color: rgba(255, 255, 255, 0.45) !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"],
+    div[data-baseweb="popover"] {
+        background-color: #1e222a !important;
+        border: 1.5px solid rgba(255, 255, 255, 0.22) !important;
+        box-shadow: 0 16px 40px -4px rgba(0, 0, 0, 0.85),
+                    0 6px 16px -2px rgba(0, 0, 0, 0.6),
+                    0 0 0 1px rgba(255, 255, 255, 0.1) !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"] ul,
+    div[data-testid="stSelectboxVirtualDropdown"] [role="listbox"],
+    div[data-baseweb="popover"] [data-baseweb="menu"],
+    div[data-baseweb="popover"] ul[role="listbox"] {
+        background-color: #1e222a !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"] [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] [role="option"],
+    div[data-testid="stSelectboxVirtualDropdown"] li,
+    div[data-baseweb="popover"] li[role="option"],
+    div[data-baseweb="popover"] li[data-baseweb="menu-item"] {
+        color: #f1f5f9 !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"] [data-hovered] [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] [data-focused] [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] li:hover [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] li:hover,
+    div[data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover,
+    div[data-baseweb="popover"] li[role="option"]:hover,
+    div[data-baseweb="popover"] li[data-baseweb="menu-item"]:hover {
+        background-color: #2e3544 !important;
+        color: #ffffff !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] [data-selected] [data-item-hl],
+    div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"],
+    div[data-testid="stSelectboxVirtualDropdown"] [data-selected],
+    div[data-baseweb="popover"] li[role="option"][aria-selected="true"],
+    div[data-baseweb="popover"] li[data-baseweb="menu-item"][aria-selected="true"] {
+        background-color: rgba(255, 75, 75, 0.22) !important;
+        color: #ff6b6b !important;
+    }
+
+    div[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] [data-item-hl] *,
+    div[data-baseweb="popover"] li[role="option"][aria-selected="true"] * {
+        color: #ff6b6b !important;
+    }
+}
+
+/* =============================================================================
+   System Prompt Action Buttons (Compact Style, Max 2 Lines, Align Left)
+   ============================================================================= */
+div[class*="st-key-system_prompt_actions_row"] {
+    margin-top: 0.35rem !important;
+}
+
+div[class*="st-key-restore_default_system_prompt"] button,
+div[class*="st-key-preview_final_script_prompt"] button {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    text-align: left !important;
+    padding: 0.35rem 0.65rem !important;
+    min-height: 2.25rem !important;
+    height: auto !important;
+    border-radius: 0.45rem !important;
+    width: 100% !important;
+}
+
+div[class*="st-key-restore_default_system_prompt"] button > *,
+div[class*="st-key-preview_final_script_prompt"] button > *,
+div[class*="st-key-restore_default_system_prompt"] button span[data-has-shortcut],
+div[class*="st-key-preview_final_script_prompt"] button span[data-has-shortcut] {
+    width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    text-align: left !important;
+    gap: 0.45rem !important;
+}
+
+div[class*="st-key-restore_default_system_prompt"] button [data-testid="stIconMaterial"],
+div[class*="st-key-preview_final_script_prompt"] button [data-testid="stIconMaterial"],
+div[class*="st-key-restore_default_system_prompt"] button span:first-child,
+div[class*="st-key-preview_final_script_prompt"] button span:first-child {
+    font-size: 1.15rem !important;
+    flex-shrink: 0 !important;
+    align-self: center !important;
+    margin: 0 !important;
+}
+
+div[class*="st-key-restore_default_system_prompt"] button div[data-testid="stMarkdownContainer"],
+div[class*="st-key-preview_final_script_prompt"] button div[data-testid="stMarkdownContainer"],
+div[class*="st-key-restore_default_system_prompt"] button p,
+div[class*="st-key-preview_final_script_prompt"] button p {
+    text-align: left !important;
+    font-size: 0.8rem !important;
+    font-weight: 500 !important;
+    line-height: 1.25 !important;
+    margin: 0 !important;
+    white-space: normal !important;
+    display: -webkit-box !important;
+    -webkit-line-clamp: 2 !important;
+    line-clamp: 2 !important;
+    -webkit-box-orient: vertical !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    word-break: break-word !important;
+}
+
