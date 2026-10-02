@@ -87,8 +87,23 @@ st.set_page_config(
 # 也会让新用户误以为需要安装额外组件。这里统一隐藏 Streamlit 平台工具栏，
 # 并压缩主容器顶部留白，只保留项目自己的标题、语言选择和业务设置区域。
 style_file = Path(__file__).with_name("styles.css")
-# Reload styles.css: update bg to #e2e8f0
-streamlit_style = f"<style>{style_file.read_text(encoding='utf-8')}</style>"
+tour_dismiss_script = """
+<script>
+(function() {
+    function markTourDismissed() {
+        try {
+            localStorage.setItem("stTour-mpt-onboarding-v1", "1");
+        } catch(e) {}
+    }
+    document.addEventListener("click", function(e) {
+        if (e.target && (e.target.closest(".driver-popover-close-btn") || e.target.closest(".driver-close-btn") || e.target.closest("[data-driver-dismiss]"))) {
+            markTourDismissed();
+        }
+    }, true);
+})();
+</script>
+"""
+streamlit_style = f"<style>{style_file.read_text(encoding='utf-8')}</style>{tour_dismiss_script}"
 st.markdown(streamlit_style, unsafe_allow_html=True)
 
 # 定义资源目录
@@ -4458,6 +4473,16 @@ def _render_local_script_generation(params):
         st.toast(tr("Please Enter the Video Subject First"), icon="⚠️")
         return
 
+    llm_provider_id = config.app.get("llm_provider", "moonshot")
+    spec = get_llm_provider(llm_provider_id)
+    if spec and spec.requires_api_key:
+        api_key = str(config.app.get(spec.config_key("api_key"), "")).strip()
+        if not api_key:
+            st.toast(tr("Please Enter the LLM API Key"), icon="⚠️")
+            _open_settings_dialog("llm")
+            st.rerun()
+            return
+
     with st.spinner(tr("Generating Video Script and Keywords")):
 
         def generate_script_and_terms(app_config_snapshot):
@@ -4486,6 +4511,10 @@ def _render_local_script_generation(params):
             st.error(tr(script))
         elif "Error: " in terms:
             st.error(tr(terms))
+        elif not script.strip():
+            st.toast(tr("Please Enter the LLM API Key"), icon="⚠️")
+            _open_settings_dialog("llm")
+            st.rerun()
         else:
             st.session_state["video_script"] = script
             st.session_state["video_terms"] = ", ".join(terms)
@@ -4968,6 +4997,14 @@ def _render_script_settings(panel, params):
                     # 视频关键词需要基于文案提取，文案为空时提前提示并跳过模型调用。
                     st.toast(tr("Please Enter the Video Subject"), icon="⚠️")
                 else:
+                    llm_provider_id = config.app.get("llm_provider", "moonshot")
+                    spec = get_llm_provider(llm_provider_id)
+                    if spec and spec.requires_api_key:
+                        api_key = str(config.app.get(spec.config_key("api_key"), "")).strip()
+                        if not api_key:
+                            st.toast(tr("Please Enter the LLM API Key"), icon="⚠️")
+                            _open_settings_dialog("llm")
+                            st.rerun()
                     with st.spinner(tr("Generating Video Keywords")):
                         terms = _run_llm_read_operation(
                             "generate_terms",
