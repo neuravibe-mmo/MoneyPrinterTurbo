@@ -119,6 +119,125 @@ class TestTaskService(unittest.TestCase):
             params.video_fit_mode,
         )
 
+    def test_stage_progress_reporter_maps_fraction_into_stage_range(self):
+        """
+        阶段内 0~1 的完成比例要换算到该阶段占用的进度区间，并保留任务已有的
+        其它字段。越界或无法解析的比例不能把进度推到区间之外。
+        """
+        state = MemoryState()
+        state.update_task("stage-progress", progress=40, video_subject="咖啡")
+
+        with patch.object(tm.sm, "state", state):
+            report = tm._stage_progress_reporter("stage-progress", 40, 50)
+            for fraction, expected in (
+                (0.0, 40),
+                (0.55, 45),
+                (1.0, 50),
+                (3.0, 50),
+                (-1.0, 40),
+            ):
+                with self.subTest(fraction=fraction):
+                    report(fraction)
+                    self.assertEqual(
+                        state.get_task("stage-progress")["progress"], expected
+                    )
+
+            report(0.5)
+            report("not a number")
+            task = state.get_task("stage-progress")
+
+        self.assertEqual(task["progress"], 45)
+        self.assertEqual(task["state"], tm.const.TASK_STATE_PROCESSING)
+        self.assertEqual(task["video_subject"], "咖啡")
+
+    def test_stage_progress_reporter_survives_state_backend_failure(self):
+        """进度只是展示信息，状态后端暂时不可用时不能让下载或合成失败。"""
+        with (
+            patch.object(
+                tm.sm.state, "update_task", side_effect=RuntimeError("redis down")
+            ),
+            patch.object(tm.logger, "warning") as warning,
+        ):
+            tm._stage_progress_reporter("stage-progress", 40, 50)(0.5)
+
+        warning.assert_called_once()
+        self.assertIn("redis down", str(warning.call_args.args[0]))
+
+    def test_material_download_moves_progress_between_40_and_50(self):
+        """
+        素材下载是慢速网络下最耗时的阶段，此前进度一直停在 40%，全部下完才
+        跳到 50%。下载过程中报告的完成比例必须反映到任务进度上。
+        """
+        params = VideoParams(video_subject="test", video_source="pexels")
+        state = MemoryState()
+        state.update_task("download-progress", progress=40)
+        observed = []
+
+        def fake_download_videos(**kwargs):
+            for fraction in (0.25, 0.5, 1.0):
+                kwargs["progress_callback"](fraction)
+                observed.append(state.get_task("download-progress")["progress"])
+            return ["a.mp4"]
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(
+                tm.material, "download_videos", side_effect=fake_download_videos
+            ),
+        ):
+            result = tm.get_video_materials(
+                "download-progress", params, ["scene"], 10
+            )
+
+        self.assertEqual(result, ["a.mp4"])
+        self.assertEqual(observed, [42, 45, 50])
+
+    def test_clip_processing_moves_progress_through_the_combine_half(self):
+        """
+        片段处理期间进度此前固定在 50%。合成占每条视频进度份额的前一半：
+        单条视频时为 50%~75%，两条视频时第二条从 75% 开始。
+        """
+        for video_count, expected in (
+            (1, [[62, 75]]),
+            (2, [[56, 62], [81, 87]]),
+        ):
+            with self.subTest(video_count=video_count):
+                params = VideoParams(video_subject="test", video_count=video_count)
+                state = MemoryState()
+                state.update_task("combine-progress", progress=50)
+                observed = []
+
+                def fake_combine_videos(**kwargs):
+                    seen = []
+                    for fraction in (0.5, 1.0):
+                        kwargs["progress_callback"](fraction)
+                        seen.append(
+                            state.get_task("combine-progress")["progress"]
+                        )
+                    observed.append(seen)
+
+                with (
+                    patch.object(tm.sm, "state", state),
+                    patch.object(
+                        tm.video, "combine_videos", side_effect=fake_combine_videos
+                    ),
+                    patch.object(tm.video, "generate_video"),
+                    patch.object(tm.task_artifacts, "patch_script_data"),
+                ):
+                    tm.generate_final_videos(
+                        task_id="combine-progress",
+                        params=params,
+                        downloaded_videos=["material.mp4"],
+                        audio_file="audio.mp3",
+                        subtitle_path="",
+                        audio_duration=5,
+                    )
+
+                self.assertEqual(observed, expected)
+                self.assertEqual(
+                    state.get_task("combine-progress")["progress"], 100
+                )
+
     def test_generate_final_videos_uses_generated_sonilo_music(self):
         """Sonilo 必须针对每条拼接后的视频生成配乐，并传给最终混音。"""
         params = VideoParams(
@@ -782,6 +901,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_uses_custom_file_inside_task_directory(self):
         task_id = "test-custom-audio-safe"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         custom_audio_file = os.path.join(task_dir, "custom-audio.mp3")
         with open(custom_audio_file, "wb") as audio:
             audio.write(b"fake audio")
@@ -793,16 +913,13 @@ class TestTaskService(unittest.TestCase):
             voice_name="test-voice",
         )
 
-        try:
-            with (
-                patch.object(tm.voice, "tts") as tts,
-                patch.object(tm.voice, "get_audio_duration", return_value=7),
-            ):
-                audio_file, audio_duration, sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts") as tts,
+            patch.object(tm.voice, "get_audio_duration", return_value=7),
+        ):
+            audio_file, audio_duration, sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertEqual(audio_file, os.path.realpath(custom_audio_file))
         self.assertEqual(audio_duration, 7)
@@ -812,6 +929,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_rejects_server_side_custom_file_by_default(self):
         task_id = "test-custom-audio-untrusted-server-side"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         state = MemoryState()
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
@@ -824,17 +942,14 @@ class TestTaskService(unittest.TestCase):
                 voice_name="test-voice",
             )
 
-            try:
-                with (
-                    patch.object(tm.voice, "tts") as tts,
-                    patch.object(tm.voice, "get_audio_duration") as get_duration,
-                    patch.object(tm.sm, "state", state),
-                ):
-                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                        task_id, params, "script"
-                    )
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            with (
+                patch.object(tm.voice, "tts") as tts,
+                patch.object(tm.voice, "get_audio_duration") as get_duration,
+                patch.object(tm.sm, "state", state),
+            ):
+                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                    task_id, params, "script"
+                )
 
         self.assertIsNone(audio_file)
         self.assertIsNone(audio_duration)
@@ -848,17 +963,15 @@ class TestTaskService(unittest.TestCase):
     def test_external_custom_audio_error_does_not_reveal_file_existence(self):
         task_id = "test-custom-audio-existence-oracle"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
             external_paths = [server_audio.name, f"{server_audio.name}.missing"]
             errors = []
-            try:
-                for external_path in external_paths:
-                    with self.assertRaises(ValueError) as raised:
-                        tm.resolve_custom_audio_file(task_id, external_path)
-                    errors.append(str(raised.exception))
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            for external_path in external_paths:
+                with self.assertRaises(ValueError) as raised:
+                    tm.resolve_custom_audio_file(task_id, external_path)
+                errors.append(str(raised.exception))
 
         self.assertEqual(errors[0], errors[1])
         self.assertIn("current task directory", errors[0])
@@ -866,6 +979,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_accepts_server_side_custom_file_for_trusted_cli(self):
         task_id = "test-custom-audio-server-side"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
             server_audio.write(b"fake audio")
@@ -877,19 +991,16 @@ class TestTaskService(unittest.TestCase):
                 voice_name="test-voice",
             )
 
-            try:
-                with (
-                    patch.object(tm.voice, "tts") as tts,
-                    patch.object(tm.voice, "get_audio_duration", return_value=6),
-                ):
-                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                        task_id,
-                        params,
-                        "script",
-                        allow_server_file_input=True,
-                    )
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            with (
+                patch.object(tm.voice, "tts") as tts,
+                patch.object(tm.voice, "get_audio_duration", return_value=6),
+            ):
+                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                    task_id,
+                    params,
+                    "script",
+                    allow_server_file_input=True,
+                )
 
         self.assertEqual(audio_file, os.path.realpath(server_audio.name))
         self.assertEqual(audio_duration, 6)
@@ -899,6 +1010,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_rejects_missing_custom_file_without_tts(self):
         task_id = "test-custom-audio-missing"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         missing_audio_file = os.path.join(task_dir, "missing.mp3")
         params = VideoParams(
             video_subject="custom audio",
@@ -908,16 +1020,13 @@ class TestTaskService(unittest.TestCase):
         )
         state = MemoryState()
 
-        try:
-            with (
-                patch.object(tm.voice, "tts") as tts,
-                patch.object(tm.sm, "state", state),
-            ):
-                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts") as tts,
+            patch.object(tm.sm, "state", state),
+        ):
+            audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertIsNone(audio_file)
         self.assertIsNone(audio_duration)
@@ -951,6 +1060,7 @@ class TestTaskService(unittest.TestCase):
             with self.subTest(file_duration=file_duration):
                 task_id = f"test-tts-audio-priority-{uuid4().hex}"
                 task_dir = utils.task_dir(task_id)
+                self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
                 audio_path = os.path.join(task_dir, "audio.mp3")
                 params = VideoParams(
                     video_subject="tts audio",
@@ -966,18 +1076,15 @@ class TestTaskService(unittest.TestCase):
                     # is exactly the regression this test exists to catch.
                     return _file if isinstance(target, str) else _sub
 
-                try:
-                    with (
-                        patch.object(tm.voice, "tts", return_value=sub_maker) as tts,
-                        patch.object(
-                            tm.voice, "get_audio_duration", side_effect=fake_duration
-                        ) as get_duration,
-                    ):
-                        audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                            task_id, params, "script"
-                        )
-                finally:
-                    shutil.rmtree(task_dir, ignore_errors=True)
+                with (
+                    patch.object(tm.voice, "tts", return_value=sub_maker) as tts,
+                    patch.object(
+                        tm.voice, "get_audio_duration", side_effect=fake_duration
+                    ) as get_duration,
+                ):
+                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                        task_id, params, "script"
+                    )
 
                 self.assertEqual(audio_file, audio_path)
                 self.assertEqual(audio_duration, expected)
@@ -998,6 +1105,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_falls_back_to_sub_maker_when_file_duration_is_zero(self):
         task_id = "test-tts-audio-fallback"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         audio_path = os.path.join(task_dir, "audio.mp3")
         params = VideoParams(
             video_subject="tts audio",
@@ -1012,18 +1120,15 @@ class TestTaskService(unittest.TestCase):
             # SubMaker word-boundary duration be used.
             return 0.0 if isinstance(target, str) else 7.8375
 
-        try:
-            with (
-                patch.object(tm.voice, "tts", return_value=sub_maker),
-                patch.object(
-                    tm.voice, "get_audio_duration", side_effect=fake_duration
-                ) as get_duration,
-            ):
-                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts", return_value=sub_maker),
+            patch.object(
+                tm.voice, "get_audio_duration", side_effect=fake_duration
+            ) as get_duration,
+        ):
+            audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertEqual(audio_file, audio_path)
         self.assertEqual(audio_duration, 8)
@@ -1112,13 +1217,16 @@ class TestTaskService(unittest.TestCase):
             shutil.rmtree(task_dir, ignore_errors=True)
 
         self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        created_path = create.call_args.kwargs["subtitle_file"]
+        self.assertNotEqual(created_path, subtitle_path)
+        self.assertEqual(Path(created_path).parent, Path(subtitle_path).parent)
         create.assert_called_once_with(
             audio_file=audio_file,
-            subtitle_file=subtitle_path,
+            subtitle_file=created_path,
             word_level=False,
         )
         correct.assert_called_once_with(
-            subtitle_file=subtitle_path, video_script="Hello world."
+            subtitle_file=created_path, video_script="Hello world."
         )
 
     def test_generate_subtitle_uses_whisper_word_timing_without_correction(self):
@@ -1169,9 +1277,12 @@ class TestTaskService(unittest.TestCase):
             shutil.rmtree(task_dir, ignore_errors=True)
 
         self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        created_path = create.call_args.kwargs["subtitle_file"]
+        self.assertNotEqual(created_path, subtitle_path)
+        self.assertEqual(Path(created_path).parent, Path(subtitle_path).parent)
         create.assert_called_once_with(
             audio_file=audio_file,
-            subtitle_file=subtitle_path,
+            subtitle_file=created_path,
             word_level=True,
         )
         correct.assert_not_called()
@@ -2488,7 +2599,7 @@ class TestTaskService(unittest.TestCase):
             paragraph_number=1,
         )
         result = tm.start(task_id=task_id, params=params)
-        print(result)
+        self.assertTrue(result.get("videos"))
 
 
 if __name__ == "__main__":

@@ -62,9 +62,11 @@ _UNSAFE_FILENAME_CHARACTERS = frozenset(
         *range(0x2066, 0x206A),
     )
 )
+# Pillow reports camera JPEGs carrying a Multi-Picture Format index (common for
+# phone and dual-lens photos) as MPO; the primary image is still a plain JPEG.
 _IMAGE_FORMATS_BY_EXTENSION = {
-    ".jpg": frozenset({"JPEG"}),
-    ".jpeg": frozenset({"JPEG"}),
+    ".jpg": frozenset({"JPEG", "MPO"}),
+    ".jpeg": frozenset({"JPEG", "MPO"}),
     ".png": frozenset({"PNG"}),
     ".bmp": frozenset({"BMP"}),
 }
@@ -195,10 +197,18 @@ def _validate_video(
                 "-v",
                 "error",
                 "-xerror",
+                # Uploaded files must be self-contained media, not playlists
+                # that cause validation/rendering to read adjacent files or URLs.
+                "-protocol_whitelist",
+                "file,pipe",
+                "-format_whitelist",
+                "mov,avi,flv,matroska",
                 "-i",
                 file_path,
                 "-map",
-                "0:v:0",
+                # Uppercase V excludes attached pictures/album covers. A cover
+                # in an audio container is not a renderable video material.
+                "0:V:0",
                 "-f",
                 "null",
                 "-",

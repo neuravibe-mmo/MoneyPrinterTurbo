@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import inspect
+import itertools
 import json
 import math
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 import unicodedata
 import wave
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Union
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape, unescape
@@ -24,12 +25,16 @@ import requests
 from edge_tts import SubMaker
 from edge_tts.srt_composer import Subtitle
 from loguru import logger
-from moviepy.video.tools import subtitles
+
+from app.utils.request_logging import trace_http_call
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from openai import OpenAI
 
 from app.config import config
+from app.services import bgm
 from app.utils import utils
+from app.utils.subtitle_reader import moviepy_subtitles
+from app.utils.subtitle_writer import staged_subtitle_file
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
 _SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
@@ -88,6 +93,10 @@ VOXCPM_REFERENCE_AUDIO_FILE_TYPES = ("wav", "mp3", "m4a", "aac", "ogg", "flac")
 _DEFAULT_TTS_FFMPEG_TIMEOUT_SECONDS = 600
 _VOXCPM_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
 _VOXCPM_RETRY_DELAY_SECONDS = (1.0, 2.0)
+# Match the existing generated-speech ceiling; allow one full Base64 WAV event
+# plus JSON framing while bounding both transport lines and multiline events.
+_VOXCPM_TTS_MAX_AUDIO_BYTES = 50 * 1024 * 1024
+_VOXCPM_SSE_MAX_EVENT_BYTES = 4 * ((_VOXCPM_TTS_MAX_AUDIO_BYTES + 2) // 3) + 64 * 1024
 NO_VOICE_NAME = "no-voice"
 # `none` 是 PR #981 里曾使用过的无配音标识。这里短期兼容这个值，避免
 # 已经手动调用过该分支的 API 用户升级后立即失效；WebUI 和新代码统一使用
@@ -109,10 +118,13 @@ def mktimestamp(time_unit: float) -> str:
     还需要这个格式化函数来兼容 Azure v2、Gemini、SiliconFlow 这些
     手工构造的字幕时间轴，因此这里内置一个等价实现。
     """
-    hour = math.floor(time_unit / 10**7 / 3600)
-    minute = math.floor((time_unit / 10**7 / 60) % 60)
-    seconds = (time_unit / 10**7) % 60
-    return f"{hour:02d}:{minute:02d}:{seconds:06.3f}"
+    # 先统一取整到毫秒再拆分时分秒。直接用 `:06.3f` 格式化取模后的秒数，
+    # 59.9996 秒会显示成 `00:00:60.000`，严格的 SRT 解析器会拒绝该时间戳。
+    total_milliseconds = int(round(time_unit / 10**4))
+    hour, remainder = divmod(total_milliseconds, 3_600_000)
+    minute, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hour:02d}:{minute:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
 def get_siliconflow_voices() -> list[str]:
@@ -196,19 +208,60 @@ def get_elevenlabs_voices(api_key: str) -> list[str]:
         url = "https://api.elevenlabs.io/v2/voices"
         params = {"is_favorite": "true", "page_size": 100}
         headers = {"xi-api-key": api_key}
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code != 200:
-            logger.warning(
-                f"ElevenLabs voices fetch failed with status {response.status_code}: {response.text}"
+        # Requests preserves custom xi-api-key headers across redirects. Keep
+        # the key on the provider endpoint even if it responds with a redirect.
+        result = []
+        seen_voices = set()
+        seen_tokens = set()
+        deadline = time.monotonic() + 30.0
+        # v2 catalogs are paginated even when page_size is at its maximum.
+        # Retain the fixed endpoint and no-redirect credential boundary.
+        for _ in range(100):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("ElevenLabs voice catalog time budget exhausted; returning partial catalog")
+                break
+            phase_timeout = min(10.0, remaining / 2.0)
+            response = trace_http_call(
+                "GET", requests.get,
+                url, params=dict(params), headers=headers,
+                timeout=(phase_timeout, phase_timeout), allow_redirects=False,
             )
-            return []
-        data = response.json()
-        voices = data.get("voices", [])
-        return [
-            f"elevenlabs:{v['voice_id']}:{v['name']}"
-            for v in voices
-            if v.get("voice_id") and v.get("name") and v.get("status") != "disabled"
-        ]
+            try:
+                if response.status_code != 200:
+                    logger.warning(
+                        f"ElevenLabs voices fetch failed with status {response.status_code}"
+                    )
+                    return []
+                data = response.json()
+            finally:
+                response.close()
+            if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
+                return []
+            for entry in data["voices"]:
+                if not isinstance(entry, dict):
+                    continue
+                identity = entry.get("voice_id")
+                name = entry.get("name")
+                if (
+                    isinstance(identity, str) and identity
+                    and isinstance(name, str) and name
+                    and entry.get("status") != "disabled"
+                    and identity not in seen_voices
+                ):
+                    seen_voices.add(identity)
+                    result.append(f"elevenlabs:{identity}:{name}")
+            token = data.get("next_page_token")
+            if data.get("has_more") is not True or not isinstance(token, str) or not token:
+                break
+            if token in seen_tokens:
+                logger.warning("ElevenLabs voice catalog repeated a page token")
+                break
+            seen_tokens.add(token)
+            params["next_page_token"] = token
+        else:
+            logger.warning("ElevenLabs voice catalog page limit reached; returning partial catalog")
+        return result
     except Exception as e:
         logger.warning(f"ElevenLabs voices fetch failed: {str(e)}")
         return []
@@ -274,7 +327,8 @@ def get_kokoro_voices(*, fallback: bool = True) -> list[str]:
                 api_key = config.kokoro.get("api_key", "")
                 if api_key:
                     headers["Authorization"] = f"Bearer {api_key}"
-                response = requests.get(
+                response = trace_http_call(
+                    "GET", requests.get,
                     f"{base_url}/audio/voices", headers=headers, timeout=5
                 )
                 if response.status_code == 200:
@@ -376,14 +430,18 @@ def parse_voice_name(name: str):
     # zh-CN-XiaoyiNeural-Female
     # zh-CN-YunxiNeural-Male
     # zh-CN-XiaoxiaoMultilingualNeural-V2-Female
-    name = name.replace("-Female", "").replace("-Male", "").strip()
+    name = name.strip()
+    # Qualified IDs belong to their provider. Gender/style display labels are
+    # parsed by each provider adapter, not rewritten inside an opaque voice ID.
+    if ":" not in name:
+        name = name.removesuffix("-Female").removesuffix("-Male")
     return name
 
 
 def is_azure_v2_voice(voice_name: str):
     voice_name = parse_voice_name(voice_name)
-    if voice_name.endswith("-V2"):
-        return voice_name.replace("-V2", "").strip()
+    if ":" not in voice_name and voice_name.endswith("-V2"):
+        return voice_name.removesuffix("-V2").strip()
     return ""
 
 
@@ -580,6 +638,23 @@ def generate_silent_audio(duration_seconds: float, output_file: str) -> bool:
     return _publish_tts_ffmpeg_output(command, output_file, "silent narration encode")
 
 
+def _warn_ignored_voice_rate(provider: str, voice_rate: float) -> None:
+    """
+    Gemini TTS, MiMo TTS and VoxCPM have no numeric speed parameter, so
+    voice_rate is not sent to them. Warn when a speed other than 1.0 is
+    requested instead of ignoring it silently.
+    """
+    try:
+        ignored = float(voice_rate) != 1.0
+    except (TypeError, ValueError, OverflowError):
+        return
+    if ignored:
+        logger.warning(
+            f"{provider} does not support numeric speed adjustment; "
+            f"voice_rate {voice_rate} is ignored"
+        )
+
+
 def _single_tts(
     text: str,
     voice_name: str,
@@ -631,6 +706,7 @@ def _single_tts(
         # 格式: gemini:voice-Style；也继续兼容旧的 gemini:voice-Gender。
         voice = parse_gemini_voice_name(voice_name)
         if voice:
+            _warn_ignored_voice_rate("Gemini TTS", voice_rate)
             return gemini_tts(text, voice, voice_rate, voice_file, voice_volume)
         else:
             logger.error(f"Invalid gemini voice name format: {voice_name}")
@@ -643,6 +719,7 @@ def _single_tts(
         if len(parts) >= 2:
             voice_with_gender = parts[1]
             voice = voice_with_gender.split("-")[0]
+            _warn_ignored_voice_rate("MiMo TTS", voice_rate)
             return mimo_tts(text, voice, voice_rate, voice_file, voice_volume)
         else:
             logger.error(f"Invalid mimo voice name format: {voice_name}")
@@ -697,6 +774,7 @@ def _single_tts(
     elif is_voxcpm_voice(voice_name):
         voice_id = voice_name.split(":", 1)[1].strip()
         if voice_id:
+            _warn_ignored_voice_rate("VoxCPM", voice_rate)
             if voxcpm_reference_audio is None:
                 return voxcpm_tts(text, voice_id, voice_file, voice_rate, voice_volume)
             return voxcpm_tts(
@@ -777,6 +855,19 @@ def _publish_tts_ffmpeg_output(
         return True
 
 
+
+def apply_audio_volume(audio_file: str, output_file: str, volume: float) -> bool:
+    """Encode narration export gain to a caller-owned destination."""
+    if not math.isfinite(volume) or volume < 0:
+        raise ValueError("audio export volume must be finite and nonnegative")
+    ensure_file_path_exists(output_file)
+    command = [
+        utils.get_ffmpeg_binary(), "-nostdin", "-v", "error", "-y",
+        "-i", audio_file, "-vn", "-af", f"volume={volume}",
+        "-codec:a", "libmp3lame", "-q:a", "4",
+    ]
+    return _publish_tts_ffmpeg_output(command, output_file, "audio export volume")
+
 def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
     """
     使用 PCM 解码与统一重编码合并多个音频分段。
@@ -806,13 +897,20 @@ def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
 
             def append_pcm(reader):
                 nonlocal combined_frames
+                chunk_frames = 0
                 while chunk := reader.readframes(8192):
+                    if len(chunk) % 2:
+                        raise ValueError("incomplete PCM sample in narration chunk")
                     combined_wave.writeframesraw(chunk)
-                    combined_frames += len(chunk) // 2
+                    chunk_frames += len(chunk) // 2
+                if not chunk_frames or chunk_frames != reader.getnframes():
+                    raise ValueError("empty or truncated narration chunk")
+                combined_frames += chunk_frames
 
             for idx, f in enumerate(audio_files):
                 if not os.path.exists(f) or os.path.getsize(f) == 0:
-                    continue
+                    logger.error(f"narration chunk is missing or empty: {f}")
+                    return False
 
                 # 检查是否已经是 24000Hz 16-bit mono WAV
                 is_valid_pcm_wav = False
@@ -864,6 +962,7 @@ def _concat_audio_files(audio_files: list[str], output_file: str) -> bool:
                             return False
                     else:
                         logger.error(f"failed to decode audio chunk with ffmpeg: {res.stderr}")
+                        return False
 
         if not combined_frames:
             logger.error("no valid audio samples to concatenate")
@@ -1067,6 +1166,13 @@ def tts(
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
 ) -> Union[SubMaker, None]:
+    # Emoji are not narrated: Edge TTS reads their names aloud ("chart
+    # increasing"), and each one gets its own word boundary.
+    narration = utils.remove_emoji(text)
+    if narration != text and not narration.strip():
+        logger.warning("the script has no text to narrate once emoji are removed")
+        return None
+    text = narration
     # 无停顿标签时，原样直通原始文本，避免无意义的正则处理或空白截断
     if not utils.has_pause_tags(text):
         return _single_tts(
@@ -1181,7 +1287,10 @@ def populate_legacy_submaker_with_full_text(
     sub_maker.subs = []
     sub_maker.offset = []
 
-    normalized_text = (text or "").strip()
+    # 与 create_subtitle() 使用同一套脚本清理：`---`、`***` 这类 Markdown
+    # 分隔行不会被朗读，若参与按字符比例分配，会占用一段音频时长，导致
+    # 后续字幕提前出现，或最后一句字幕在音频结束前就消失。
+    normalized_text = utils.normalize_script_for_subtitle_matching(text or "").strip()
     if not normalized_text:
         return sub_maker
 
@@ -1225,6 +1334,11 @@ def populate_legacy_submaker_with_full_text(
     return sub_maker
 
 
+# edge-tts expands short names such as en-US-AriaNeural itself, but its pattern
+# rejects a locale with a script subtag (iu-Cans-CA-SiqiniqNeural).
+_EDGE_SCRIPT_SUBTAG_VOICE = re.compile(r"^([a-z]{2,3}-[A-Z][a-z]{3}-[A-Z]{2})-(\w+Neural)$")
+
+
 def create_edge_tts_communicate(
     text: str, voice_name: str, rate_str: str
 ) -> edge_tts.Communicate:
@@ -1245,6 +1359,12 @@ def create_edge_tts_communicate(
 
     if "boundary" in communicate_signature.parameters:
         communicate_kwargs["boundary"] = "WordBoundary"
+
+    # Pass those voices in the full form that edge-tts sends for every voice.
+    script_subtag_voice = _EDGE_SCRIPT_SUBTAG_VOICE.match(voice_name)
+    if script_subtag_voice:
+        locale, name = script_subtag_voice.groups()
+        voice_name = f"Microsoft Server Speech Text to Speech Voice ({locale}, {name})"
 
     return edge_tts.Communicate(text, voice_name, **communicate_kwargs)
 
@@ -1294,45 +1414,130 @@ def _stream_edge_tts_sync_with_timeout(
     到达超时时间后直接抛出 TimeoutError，让外层重试和错误日志继续工作。
 
     注意：
-    daemon 线程只作为兜底保护使用，最多随 Azure TTS V1 的 3 次重试产生
-    少量残留线程；进程退出时会自动回收。相比 WebUI 任务永久卡住，这是
-    更可控的失败模式。
+    直接消费 SDK 的异步流，绕过 stream_sync 内部的无界队列。队列只保留
+    一块数据；超时或回调失败会取消异步生产者并关闭网络流。仅支持同步流的
+    适配器在阻塞读取返回后协作退出，不会继续累积已被放弃的数据。
     """
-    stream_queue = queue.Queue()
-    done_marker = object()
+    stream_queue = queue.Queue(maxsize=1)
+    stopped = threading.Event()
+    # Set on the producer loop each time the consumer takes an item.
+    item_taken = asyncio.Event()
+    producer_loop = None
+    producer_task = None
+
+    def _put(item):
+        while not stopped.is_set():
+            try:
+                stream_queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    async def _put_async(item):
+        while not stopped.is_set():
+            # Clear before the put, so a take right after it still wakes us.
+            item_taken.clear()
+            try:
+                stream_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                # Resume as soon as the consumer takes the pending item. The
+                # timeout only re-checks `stopped`; cancellation still works.
+                try:
+                    await asyncio.wait_for(item_taken.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+        return False
+
+    def _wake_producer():
+        if producer_loop is not None:
+            try:
+                producer_loop.call_soon_threadsafe(item_taken.set)
+            except RuntimeError:
+                pass  # The producer already finished and closed its loop.
+
+    async def _produce_async():
+        if stopped.is_set():
+            return
+        stream = communicate.stream()
+        try:
+            async for chunk in stream:
+                if not await _put_async(("chunk", chunk)):
+                    return
+            await _put_async(("done", None))
+        except Exception as error:
+            await _put_async(("error", error))
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if callable(close_stream):
+                await close_stream()
 
     def _produce_chunks():
+        nonlocal producer_loop, producer_task
+        # The SDK's stream_sync() has its own unbounded queue/executor. Using
+        # its async source directly lets cancellation reach the network read.
+        if callable(getattr(communicate, "stream", None)):
+            producer_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(producer_loop)
+            producer_task = producer_loop.create_task(_produce_async())
+            if stopped.is_set():
+                producer_task.cancel()
+            try:
+                producer_loop.run_until_complete(producer_task)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                producer_loop.run_until_complete(producer_loop.shutdown_asyncgens())
+                producer_loop.close()
+            return
+        # Compatibility for stream_sync-only adapters: cooperative termination
+        # after a blocked read returns, with the same bounded mailbox.
+        stream = None
         try:
-            for chunk in communicate.stream_sync():
-                stream_queue.put(("chunk", chunk))
-            stream_queue.put(("done", done_marker))
-        except Exception as e:
-            stream_queue.put(("error", e))
+            stream = communicate.stream_sync()
+            for chunk in stream:
+                if not _put(("chunk", chunk)):
+                    return
+            _put(("done", None))
+        except Exception as error:
+            _put(("error", error))
+        finally:
+            close_stream = getattr(stream, "close", None)
+            if callable(close_stream):
+                close_stream()
 
     thread = threading.Thread(target=_produce_chunks, daemon=True)
     thread.start()
 
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise TimeoutError(
-                f"edge_tts stream timed out after {timeout_seconds:g}s"
-            )
-
-        try:
-            item_type, payload = stream_queue.get(
-                timeout=min(0.5, remaining_seconds)
-            )
-        except queue.Empty:
-            continue
-
-        if item_type == "chunk":
-            on_chunk(payload)
-        elif item_type == "error":
-            raise payload
-        elif item_type == "done":
-            return
+    try:
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError(
+                    f"edge_tts stream timed out after {timeout_seconds:g}s"
+                )
+            try:
+                item_type, payload = stream_queue.get(
+                    timeout=min(0.5, remaining_seconds)
+                )
+            except queue.Empty:
+                continue
+            _wake_producer()
+            if item_type == "chunk":
+                on_chunk(payload)
+            elif item_type == "error":
+                raise payload
+            elif item_type == "done":
+                return
+    finally:
+        stopped.set()
+        if producer_loop is not None and producer_task is not None:
+            try:
+                producer_loop.call_soon_threadsafe(producer_task.cancel)
+            except RuntimeError:
+                pass  # The producer already finished and closed its loop.
 
 
 def stream_edge_tts_chunks(
@@ -1389,6 +1594,7 @@ def azure_tts_v1(
     text = text.strip()
     rate_str = convert_rate_to_percent(voice_rate)
     for i in range(3):
+        temp_path = None
         try:
             logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
 
@@ -1400,7 +1606,12 @@ def azure_tts_v1(
             sub_maker = edge_tts.SubMaker()
             timeout_seconds = get_edge_tts_timeout_seconds()
 
-            with open(voice_file, "wb") as file:
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix=".edge-tts-",
+                suffix=os.path.splitext(voice_file)[1] or ".mp3",
+                dir=os.path.dirname(os.path.abspath(voice_file)),
+            )
+            with os.fdopen(descriptor, "wb") as file:
                 def _handle_chunk(chunk):
                     chunk_type = chunk["type"]
                     if chunk_type == "audio":
@@ -1417,29 +1628,30 @@ def azure_tts_v1(
 
             # Edge can finish a stream with timing events but no audio payload.
             # Those events produce a nonempty SRT, yet the MP3 is unplayable.
-            if os.path.getsize(voice_file) == 0:
+            if os.path.getsize(temp_path) == 0:
                 logger.warning("failed, edge tts stream contained no audio")
-                os.remove(voice_file)
                 continue
 
             if not sub_maker.get_srt():
                 logger.warning("failed, sub_maker.get_srt() is empty")
                 continue
 
+            # Audio and its timing belong to this same completed attempt.
+            # Failed retries must not replace previously successful narration.
+            os.replace(temp_path, voice_file)
+            temp_path = None
             logger.info(f"completed, output file: {voice_file}")
             return sub_maker
         except Exception as e:
             logger.error(f"failed, error: {str(e)}")
-            # TTS 流式写入如果在首包前超时或网络异常，会留下 0 字节音频文件。
-            # 这种文件既不可播放，也可能误导后续排查，因此失败后只清理空文件；
-            # 如果已经写入了部分数据，则保留现场文件，便于分析服务端返回内容。
-            if os.path.exists(voice_file) and os.path.getsize(voice_file) == 0:
+        finally:
+            if temp_path is not None:
                 try:
-                    os.remove(voice_file)
-                except Exception as remove_error:
+                    os.remove(temp_path)
+                except OSError as remove_error:
                     logger.warning(
-                        "failed to remove empty tts file: "
-                        f"{voice_file}, error: {str(remove_error)}"
+                        "failed to remove temporary Edge TTS audio: "
+                        f"{temp_path}, error: {remove_error}"
                     )
     return None
 
@@ -1473,11 +1685,15 @@ def siliconflow_tts(
         logger.error("SiliconFlow API key is not set")
         return None
 
-    # 将voice_volume转换为硅基流动的增益范围
-    # 默认voice_volume为1.0，对应gain为0
-    gain = voice_volume - 1.0
-    # 确保gain在[-10, 10]范围内
-    gain = max(-10, min(10, gain))
+    # voice_volume 是线性倍数，硅基流动的 gain 单位是 dB，范围 [-10, 10]。
+    # 默认 1.0 对应 0 dB；2.0 约为 +6 dB，0.6 约为 -4.4 dB。直接相减会把
+    # 2 倍音量当作 +1 dB，试听音量与最终视频的线性混音结果明显不一致。
+    if voice_volume is None:
+        voice_volume = 1.0
+    if voice_volume <= 0:
+        gain = -10.0
+    else:
+        gain = max(-10.0, min(10.0, 20.0 * math.log10(voice_volume)))
 
     url = "https://api.siliconflow.cn/v1/audio/speech"
 
@@ -1496,19 +1712,28 @@ def siliconflow_tts(
 
     for i in range(3):  # 尝试3次
         temporary_audio = None
+        response_accepted = False
         try:
             logger.info(
                 f"start siliconflow tts, model: {model}, voice: {voice}, try: {i + 1}"
             )
 
-            response = requests.post(
+            response = trace_http_call(
+                "POST", requests.post,
                 url,
                 json=payload,
                 headers=headers,
+                allow_redirects=False,
                 timeout=_SILICONFLOW_TTS_TIMEOUT_SECONDS,
             )
 
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code == 200:
+                response_accepted = True
                 if not response.content:
                     logger.error("siliconflow tts returned empty audio")
                     return None
@@ -1527,6 +1752,7 @@ def siliconflow_tts(
                 sub_maker = ensure_legacy_submaker_fields(SubMaker())
 
                 try:
+                    _validate_remote_tts_audio(temporary_audio)
                     audio_clip = AudioFileClip(temporary_audio)
                     try:
                         audio_duration = audio_clip.duration
@@ -1568,6 +1794,10 @@ def siliconflow_tts(
             return None
         except Exception as e:
             logger.error(f"siliconflow tts failed: {str(e)}")
+            if response_accepted:
+                # Retrying local processing cannot recover this accepted response
+                # and would submit another synthesis request.
+                return None
         finally:
             if temporary_audio and os.path.exists(temporary_audio):
                 try:
@@ -1595,10 +1825,11 @@ def _build_azure_v2_ssml(text: str, voice_name: str, voice_rate: float) -> str:
         else "en-US"
     )
     escaped_text = escape(text)
+    escaped_voice_locale = escape(voice_locale, {'"': "&quot;"})
     escaped_voice_name = escape(voice_name, {'"': "&quot;"})
     return (
         '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-        f'xml:lang="{voice_locale}">'
+        f'xml:lang="{escaped_voice_locale}">'
         f'<voice name="{escaped_voice_name}">'
         f'<prosody rate="{normalized_rate:g}">{escaped_text}</prosody>'
         "</voice></speak>"
@@ -1619,22 +1850,19 @@ def azure_tts_v2(
     ssml = _build_azure_v2_ssml(text, voice_name, voice_rate)
 
     def _format_duration_to_offset(duration) -> int:
-        if isinstance(duration, str):
-            time_obj = datetime.strptime(duration, "%H:%M:%S.%f")
-            milliseconds = (
-                (time_obj.hour * 3600000)
-                + (time_obj.minute * 60000)
-                + (time_obj.second * 1000)
-                + (time_obj.microsecond // 1000)
-            )
-            return milliseconds * 10000
-
+        if isinstance(duration, timedelta):
+            # Speech SDK durations are timedeltas; integer arithmetic retains
+            # all microseconds and also handles zero/exact-second durations.
+            return ((duration.days * 86400 + duration.seconds) * 1000000
+                    + duration.microseconds) * 10
         if isinstance(duration, int):
             return duration
-
         return 0
 
     for i in range(3):
+        temporary_audio = None
+        audio_config = None
+        speech_synthesizer = None
         try:
             logger.info(
                 f"start, voice name: {voice_name}, rate: {voice_rate}, try: {i + 1}"
@@ -1653,7 +1881,7 @@ def azure_tts_v2(
                 # print('\tTextOffset: {}'.format(evt.text_offset))
                 # print('\tWordLength: {}'.format(evt.word_length))
 
-                duration = _format_duration_to_offset(str(evt.duration))
+                duration = _format_duration_to_offset(evt.duration)
                 offset = _format_duration_to_offset(evt.audio_offset)
                 sub_maker.subs.append(evt.text)
                 sub_maker.offset.append((offset, offset + duration))
@@ -1665,9 +1893,15 @@ def azure_tts_v2(
                 logger.error("Azure speech key or region is not set")
                 return None
 
-            audio_config = speechsdk.audio.AudioOutputConfig(
-                filename=voice_file, use_default_speaker=True
+            # File and default-speaker output are mutually exclusive SDK modes.
+            # Let each attempt own a private file, never the last good export.
+            ensure_file_path_exists(voice_file)
+            descriptor, temporary_audio = tempfile.mkstemp(
+                prefix=".azure-tts-", suffix=".mp3",
+                dir=os.path.dirname(os.path.abspath(voice_file)),
             )
+            os.close(descriptor)
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=temporary_audio)
             speech_config = speechsdk.SpeechConfig(
                 subscription=speech_key, region=service_region
             )
@@ -1693,6 +1927,15 @@ def azure_tts_v2(
             # 正式生成都会按 WebUI/API 传入的 voice_rate 调整语速。
             result = speech_synthesizer.speak_ssml_async(ssml).get()
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                if os.path.getsize(temporary_audio) <= 0:
+                    logger.error("Azure completed without audio; preserve the previous export")
+                    return None
+                # Release SDK file-output owners before publication, including
+                # on Windows where an open handle can prevent replacement.
+                speech_synthesizer = None
+                audio_config = None
+                os.replace(temporary_audio, voice_file)
+                temporary_audio = None
                 logger.success(f"azure v2 speech synthesis succeeded: {voice_file}")
                 return sub_maker
             elif result.reason == speechsdk.ResultReason.Canceled:
@@ -1707,6 +1950,18 @@ def azure_tts_v2(
             logger.info(f"completed, output file: {voice_file}")
         except Exception as e:
             logger.error(f"failed, error: {str(e)}")
+        finally:
+            # Exceptions/cancellation can also leave the SDK output owner alive.
+            # Drop all file owners before attempting to remove its staged file.
+            speech_synthesizer = None
+            audio_config = None
+            if temporary_audio is not None:
+                try:
+                    os.remove(temporary_audio)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(f"failed to remove staged Azure audio: {exc}")
     return None
 
 
@@ -1737,6 +1992,7 @@ def gemini_tts(
     from google.genai import types
     _configure_pydub_ffmpeg(AudioSegment)
     
+    temporary_audio = None
     try:
         api_key = config.app.get("gemini_api_key", "")
         if not api_key:
@@ -1765,20 +2021,25 @@ def gemini_tts(
                 config=generation_config,
             )
 
-        # 检查响应
-        if not response.candidates or not response.candidates[0].content:
-            logger.error("No audio content received from Gemini TTS")
-            return None
-            
-        # 获取音频数据
+        # A blocked prompt can have no candidates; a stopped candidate can
+        # have no content or parts. All are empty-audio responses, not decoder
+        # errors. Preserve the provider's reason without logging its text.
+        candidate = response.candidates[0] if response.candidates else None
+        content = getattr(candidate, "content", None)
         audio_data = None
-        for part in response.candidates[0].content.parts:
+        for part in getattr(content, "parts", None) or []:
             if hasattr(part, 'inline_data') and part.inline_data:
                 audio_data = part.inline_data.data
                 break
                 
         if not audio_data:
-            logger.error("No audio data found in response")
+            feedback = getattr(response, "prompt_feedback", None)
+            logger.error(
+                "No audio data received from Gemini TTS: "
+                "finish_reason={}, prompt_block_reason={}",
+                getattr(candidate, "finish_reason", None),
+                getattr(feedback, "block_reason", None),
+            )
             return None
             
         # 音频数据已经是原始字节，不需要base64解码
@@ -1812,21 +2073,29 @@ def gemini_tts(
 
         # pydub 会返回打开的输出文件对象。批量生成时若不主动关闭，文件描述符
         # 会持续累积，并在 Windows 上增加后续覆盖或删除音频文件失败的概率。
-        exported_audio = audio_segment.export(voice_file, format="mp3")
+        if len(audio_segment) <= 0:
+            raise ValueError("Gemini returned empty PCM audio")
+        temp_fd, temporary_audio = tempfile.mkstemp(
+            prefix=".gemini-tts-", suffix=".mp3",
+            dir=os.path.dirname(os.path.abspath(voice_file)),
+        )
+        os.close(temp_fd)
+        exported_audio = audio_segment.export(temporary_audio, format="mp3")
         exported_audio.close()
-        
-        logger.info(f"completed, output file: {voice_file}")
         
         # Gemini 拿不到 edge_tts 那种逐词边界事件，因此这里退回到
         # 项目原有的 `subs/offset` 兼容结构，至少保证后续字幕与时长
         # 计算链路可继续工作。
         sub_maker = ensure_legacy_submaker_fields(SubMaker())
         audio_duration = len(audio_segment) / 1000.0  # 转换为秒
-        return populate_legacy_submaker_with_full_text(
+        sub_maker = populate_legacy_submaker_with_full_text(
             sub_maker=sub_maker,
             text=text,
             audio_duration_seconds=audio_duration,
         )
+        os.replace(temporary_audio, voice_file)
+        logger.info(f"completed, output file: {voice_file}")
+        return sub_maker
         
     except ImportError as e:
         logger.error(f"Missing required package for Gemini TTS: {str(e)}. Please install: pip install pydub")
@@ -1834,6 +2103,13 @@ def gemini_tts(
     except Exception as e:
         logger.error(f"Gemini TTS failed, error: {str(e)}")
         return None
+
+    finally:
+        if temporary_audio and os.path.exists(temporary_audio):
+            try:
+                os.unlink(temporary_audio)
+            except OSError as cleanup_error:
+                logger.warning(f"could not remove Gemini staging audio: {cleanup_error}")
 
 
 def mimo_tts(
@@ -1874,14 +2150,18 @@ def mimo_tts(
 
     _configure_pydub_ffmpeg(AudioSegment)
 
-    for i in range(3):
-        try:
-            logger.info(
-                f"start mimo tts, model: {model_name}, voice: {voice_name}, try: {i + 1}"
-            )
-            ensure_file_path_exists(voice_file)
+    temporary_audio = None
+    try:
+        logger.info(
+            f"start mimo tts, model: {model_name}, voice: {voice_name}"
+        )
+        ensure_file_path_exists(voice_file)
 
-            client = OpenAI(api_key=api_key, base_url=base_url)
+        # A lost response may still have generated and billed the narration.
+        # Disable SDK retries as well as the outer retry loop.
+        with OpenAI(
+            api_key=api_key, base_url=base_url, max_retries=0, timeout=120.0
+        ) as client:
             completion = client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -1894,44 +2174,62 @@ def mimo_tts(
                 },
             )
 
-            if not completion or not getattr(completion, "choices", None):
-                raise ValueError("MiMo TTS returned empty response")
+        if not completion or not getattr(completion, "choices", None):
+            raise ValueError("MiMo TTS returned empty response")
 
-            message = completion.choices[0].message
-            audio = getattr(message, "audio", None)
-            audio_data = None
-            if isinstance(audio, dict):
-                audio_data = audio.get("data")
-            elif audio is not None:
-                audio_data = getattr(audio, "data", None)
+        message = completion.choices[0].message
+        audio = getattr(message, "audio", None)
+        audio_data = None
+        if isinstance(audio, dict):
+            audio_data = audio.get("data")
+        elif audio is not None:
+            audio_data = getattr(audio, "data", None)
 
-            if not audio_data:
-                raise ValueError("MiMo TTS returned empty audio data")
+        if not audio_data:
+            raise ValueError("MiMo TTS returned empty audio data")
 
-            audio_bytes = base64.b64decode(audio_data)
-            audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
+        audio_bytes = base64.b64decode(audio_data)
+        audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
 
-            output_format = utils.parse_extension(voice_file) or "mp3"
-            if output_format == "wav":
-                with open(voice_file, "wb") as f:
-                    f.write(audio_bytes)
-            else:
-                audio_segment.export(voice_file, format=output_format)
+        output_format = utils.parse_extension(voice_file) or "mp3"
+        descriptor, temporary_audio = tempfile.mkstemp(
+            prefix=".mimo-tts-", suffix=f".{output_format}",
+            dir=os.path.dirname(os.path.abspath(voice_file)),
+        )
+        os.close(descriptor)
+        if output_format == "wav":
+            with open(temporary_audio, "wb") as f:
+                f.write(audio_bytes)
+        else:
+            exported_audio = audio_segment.export(temporary_audio, format=output_format)
+            if exported_audio is not None:
+                exported_audio.close()
 
-            audio_duration = len(audio_segment) / 1000.0
-            sub_maker = ensure_legacy_submaker_fields(SubMaker())
-            logger.success(f"mimo tts succeeded: {voice_file}")
-            logger.debug(
-                "mimo subtitle timeline generated, "
-                f"duration: {audio_duration:.3f}s, output_format: {output_format}"
-            )
-            return populate_legacy_submaker_with_full_text(
-                sub_maker=sub_maker,
-                text=text,
-                audio_duration_seconds=audio_duration,
-            )
-        except Exception as e:
-            logger.error(f"mimo tts failed: {str(e)}")
+        audio_duration = len(audio_segment) / 1000.0
+        if audio_duration <= 0:
+            raise ValueError("MiMo TTS returned empty audio")
+        sub_maker = ensure_legacy_submaker_fields(SubMaker())
+        populated_sub_maker = populate_legacy_submaker_with_full_text(
+            sub_maker=sub_maker,
+            text=text,
+            audio_duration_seconds=audio_duration,
+        )
+        os.replace(temporary_audio, voice_file)
+        temporary_audio = None
+        logger.success(f"mimo tts succeeded: {voice_file}")
+        logger.debug(
+            "mimo subtitle timeline generated, "
+            f"duration: {audio_duration:.3f}s, output_format: {output_format}"
+        )
+        return populated_sub_maker
+    except Exception as e:
+        logger.error(f"mimo tts failed: {str(e)}")
+    finally:
+        if temporary_audio and os.path.exists(temporary_audio):
+            try:
+                os.remove(temporary_audio)
+            except OSError as cleanup_error:
+                logger.warning(f"failed to remove temporary MiMo audio: {cleanup_error}")
 
     return None
 
@@ -2016,7 +2314,8 @@ def get_minimax_voice_catalog(
         if tts_endpoint.endswith("/t2a_v2")
         else f"{tts_endpoint.rstrip('/')}/get_voice"
     )
-    response = requests.post(
+    response = trace_http_call(
+        "POST", requests.post,
         voice_endpoint,
         json={"voice_type": voice_type},
         headers={
@@ -2066,6 +2365,19 @@ def get_minimax_voice_catalog(
     return catalog
 
 
+def _validate_remote_tts_audio(file_path: str) -> None:
+    """Decode accepted audio fully before replacing a successful narration.
+
+    MoviePy's duration/initial frame probe does not validate later MP3 frames.
+    Reuse the bounded, self-contained FFmpeg audio validator without following
+    playlists or resubmitting an already accepted speech request.
+    """
+    try:
+        bgm.validate_audio_file(file_path, timeout_seconds=120)
+    except (bgm.BgmUploadError, bgm.BgmServiceError) as exc:
+        raise ValueError("TTS returned audio that could not be fully decoded") from exc
+
+
 def _write_validated_minimax_audio(audio_bytes: bytes, voice_file: str) -> float:
     """
     将 MiniMax 音频原子写入目标路径，并返回时长。
@@ -2085,6 +2397,30 @@ def _write_validated_minimax_audio(audio_bytes: bytes, voice_file: str) -> float
         with open(temp_path, "wb") as output:
             output.write(audio_bytes)
 
+        _validate_remote_tts_audio(temp_path)
+        # MiniMax's configured response container can differ from the caller's
+        # artifact extension (the task pipeline normally requests audio.mp3).
+        # Keep matching payloads byte-identical; transcode supported mismatches
+        # before publication so MIME/extension consumers see the promised codec.
+        source_format = (
+            "wav" if audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"
+            else "flac" if audio_bytes.startswith(b"fLaC")
+            else "mp3" if audio_bytes.startswith(b"ID3") or (
+                len(audio_bytes) >= 2 and audio_bytes[0] == 0xFF
+                and audio_bytes[1] & 0xE0 == 0xE0
+            )
+            else None
+        )
+        output_format = output_suffix.lstrip(".").lower()
+        if source_format and output_format in {"mp3", "wav", "flac"} and source_format != output_format:
+            from pydub import AudioSegment
+
+            _configure_pydub_ffmpeg(AudioSegment)
+            segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=source_format)
+            exported = segment.export(temp_path, format=output_format)
+            if exported is not None:
+                exported.close()
+            _validate_remote_tts_audio(temp_path)
         audio_clip = AudioFileClip(temp_path)
         try:
             audio_duration = float(audio_clip.duration)
@@ -2128,8 +2464,8 @@ def minimax_tts(text: str, voice_id: str, voice_rate: float, voice_file: str, vo
         logger.error(f"Invalid MiniMax TTS audio setting: {str(exc)}")
         return None
     audio_format = str(settings.get("audio_format", "mp3") or "mp3").strip()
-    if audio_format not in {"mp3", "wav", "flac", "pcm"}:
-        logger.error(f"Unsupported MiniMax TTS audio format: {audio_format}")
+    if audio_format not in {"mp3", "wav", "flac"}:
+        logger.error(f"Unsupported MiniMax TTS audio format: {audio_format}; choose mp3, wav, or flac")
         return None
     payload = {
         "model": model, "text": text, "stream": False, "language_boost": "auto", "output_format": "hex",
@@ -2138,25 +2474,40 @@ def minimax_tts(text: str, voice_id: str, voice_rate: float, voice_file: str, vo
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     for attempt in range(3):
+        received_success = False
         try:
             logger.info(f"start MiniMax TTS, model: {model}, voice: {voice_id}, try: {attempt + 1}")
-            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response = trace_http_call(
+                "POST", requests.post, url, json=payload, headers=headers, allow_redirects=False, timeout=120)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(f"MiniMax TTS failed with status {response.status_code}: {response.text[:200]}")
                 continue
+            received_success = True
             body = response.json()
             data = body.get("data") or {}
             base_resp = body.get("base_resp") or {}
-            if base_resp.get("status_code") != 0 or data.get("status") != 2:
+            status_code = base_resp.get("status_code")
+            if not isinstance(status_code, int) or isinstance(status_code, bool):
+                logger.error("MiniMax returned an unknown acceptance status; stop paid retries")
+                return None
+            if status_code != 0:
                 logger.error(f"MiniMax TTS returned an unsuccessful response: status_code={base_resp.get('status_code')}, audio_status={data.get('status')}")
                 continue
+            if data.get("status") != 2:
+                logger.error("MiniMax accepted the request but returned incomplete audio")
+                return None
             audio_hex = data.get("audio")
             if not isinstance(audio_hex, str) or not audio_hex:
                 logger.error("MiniMax TTS returned empty audio data")
-                continue
+                return None
             if len(audio_hex) > _MINIMAX_TTS_MAX_AUDIO_HEX_CHARS:
                 logger.error("MiniMax TTS returned audio data exceeding the supported size")
-                continue
+                return None
             audio_duration = _write_validated_minimax_audio(bytes.fromhex(audio_hex), voice_file)
             logger.success(f"MiniMax TTS succeeded: {voice_file}")
             return populate_legacy_submaker_with_full_text(
@@ -2170,8 +2521,12 @@ def minimax_tts(text: str, voice_id: str, voice_rate: float, voice_file: str, vo
                 f"stop paid retries: {type(exc).__name__}"
             )
             return None
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
             logger.error(f"MiniMax TTS failed: {str(exc)}")
+            if received_success:
+                # The request may already be billed, even if JSON/audio parsing
+                # or local file publication failed. Never regenerate it here.
+                return None
     return None
 
 
@@ -2212,9 +2567,31 @@ def elevenlabs_tts(
         },
     }
 
+    # The live v2 endpoint rejects speeds outside 0.7–1.2; v3 supports
+    # the wider REST range. Never silently clamp a selected UI/API speed.
+    minimum_speed, maximum_speed = (0.25, 4.0) if model_id == "eleven_v3" else (0.7, 1.2)
+    speed_error = (
+        f"ElevenLabs model {model_id} speech speed must be a finite number "
+        f"from {minimum_speed} to {maximum_speed}; choose a supported speed "
+        "or use eleven_v3 for a wider range"
+    )
+    try:
+        speed = float(voice_rate) if voice_rate is not None else 1.0
+    except (TypeError, ValueError, OverflowError):
+        logger.error(speed_error)
+        return None
+    if speed != 1.0 and model_id in {"eleven_v4", "eleven_v4_turbo"}:
+        logger.error(f"ElevenLabs model {model_id} does not support speech speed; use 1.0 or a v2/v3 model")
+        return None
+    if not math.isfinite(speed) or not minimum_speed <= speed <= maximum_speed:
+        logger.error(speed_error)
+        return None
+    if speed != 1.0:
+        payload["voice_settings"]["speed"] = speed
+
     # Errors where retrying will never help (auth/access/validation failures).
     _NON_RETRYABLE_CODES = {401, 403, 422}
-    _NON_RETRYABLE_STATUSES = {"voice_disabled", "voice_access_denied", "unauthorized"}
+    _NON_RETRYABLE_STATUSES = {"voice_disabled", "voice_access_denied", "unauthorized", "invalid_voice_settings"}
 
     for i in range(3):
         response = None
@@ -2223,9 +2600,20 @@ def elevenlabs_tts(
             logger.info(f"start elevenlabs tts, voice_id: {voice_id}, try: {i + 1}")
             ensure_file_path_exists(voice_file)
 
-            response = requests.post(
-                url, json=payload, headers=headers, timeout=60, stream=True
+            response = trace_http_call(
+                "POST", requests.post,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=60,
+                stream=True,
+                allow_redirects=False,
             )
+            if 300 <= response.status_code < 400:
+                # A paid request may already have reached the provider. Do not
+                # follow the redirect with our key or resubmit the generation.
+                logger.error("ElevenLabs TTS returned a redirect; stop paid retries")
+                return None
             if response.status_code != 200:
                 error_status = ""
                 error_bytes = bytearray()
@@ -2247,7 +2635,9 @@ def elevenlabs_tts(
                     logger.error(
                         f"ElevenLabs TTS failed (non-retryable) — voice_id: {voice_id}, "
                         f"status: {response.status_code}, error: {error_status or error_text}. "
-                        "Please select a different ElevenLabs voice."
+                        + (f"Check the selected model and speech speed: {error_text}"
+                           if error_status == "invalid_voice_settings"
+                           else "Please select a different ElevenLabs voice.")
                     )
                     return None
 
@@ -2275,6 +2665,7 @@ def elevenlabs_tts(
                 logger.error("ElevenLabs TTS returned no audio data")
                 return None
 
+            _validate_remote_tts_audio(temp_path)
             audio_clip = AudioFileClip(temp_path)
             try:
                 audio_duration = float(audio_clip.duration)
@@ -2355,17 +2746,25 @@ def _openai_compatible_tts(
 
     for i in range(3):
         temporary_audio = None
+        response_accepted = False
         try:
             logger.info(f"start {provider} tts, voice: {voice}, try: {i + 1}")
             ensure_file_path_exists(voice_file)
 
-            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response = trace_http_call(
+                "POST", requests.post, url, json=payload, headers=headers, allow_redirects=False, timeout=120)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(
                     f"{provider} tts failed with status {response.status_code}: {response.text[:200]}"
                 )
                 continue
 
+            response_accepted = True
             if not response.content:
                 raise ValueError(f"{provider} returned empty audio")
 
@@ -2378,6 +2777,7 @@ def _openai_compatible_tts(
                 temporary_audio = f.name
                 f.write(response.content)
 
+            _validate_remote_tts_audio(temporary_audio)
             audio_clip = AudioFileClip(temporary_audio)
             try:
                 audio_duration = audio_clip.duration
@@ -2394,8 +2794,24 @@ def _openai_compatible_tts(
                 text=text,
                 audio_duration_seconds=audio_duration,
             )
+        except requests.exceptions.ConnectTimeout:
+            # No connection was established; retrying cannot replay synthesis.
+            logger.warning(f"{provider} tts could not connect, retrying")
+        except requests.exceptions.RequestException as exc:
+            # A lost response can follow successful remote synthesis. Keep the
+            # same acceptance boundary as hosted speech providers: do not POST
+            # again when the first request's outcome is unknown.
+            logger.error(
+                f"{provider} tts result is unconfirmed after a transport error; "
+                f"stop speech retries: {type(exc).__name__}"
+            )
+            return None
         except Exception as e:
             logger.error(f"{provider} tts failed: {str(e)}")
+            if response_accepted:
+                # Retrying local processing cannot recover this accepted response
+                # and would submit another synthesis request.
+                return None
         finally:
             if temporary_audio and os.path.exists(temporary_audio):
                 try:
@@ -2589,7 +3005,13 @@ def fish_audio_tts(
             )
             ensure_file_path_exists(voice_file)
 
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            response = trace_http_call(
+                "POST", requests.post, url, json=payload, headers=headers, allow_redirects=False, timeout=60)
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code == 401:
                 logger.error(
                     "Fish Audio TTS failed: Invalid API key (401). "
@@ -2631,6 +3053,7 @@ def fish_audio_tts(
                 temporary_audio = f.name
                 f.write(response.content)
 
+            _validate_remote_tts_audio(temporary_audio)
             audio_clip = AudioFileClip(temporary_audio)
             try:
                 audio_duration = audio_clip.duration
@@ -2673,25 +3096,68 @@ def fish_audio_tts(
 
 
 def _iter_voxcpm_sse_events(response):
-    """Yield JSON payloads from ModelBest's Server-Sent Event stream."""
+    """Yield bounded SSE events without Requests' unbounded line buffer."""
+    def lines():
+        pending = bytearray()
+        skip_lf = False
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            # Consume the optional LF after a CR, even across transport chunks.
+            if skip_lf:
+                skip_lf = False
+                if chunk.startswith(b"\n"):
+                    chunk = chunk[1:]
+                if not chunk:
+                    continue
+            for piece in chunk.splitlines(keepends=True):
+                if piece.endswith(b"\r\n"):
+                    payload, terminated = piece[:-2], True
+                elif piece.endswith((b"\r", b"\n")):
+                    payload, terminated = piece[:-1], True
+                else:
+                    payload, terminated = piece, False
+                if len(pending) + len(payload) > _VOXCPM_SSE_MAX_EVENT_BYTES:
+                    raise ValueError("VoxCPM SSE line exceeds the size limit")
+                pending.extend(payload)
+                if terminated:
+                    yield bytes(pending).decode("utf-8")
+                    pending.clear()
+            skip_lf = chunk.endswith(b"\r")
+        if pending:
+            yield bytes(pending).decode("utf-8")
+
+    def parse_event(data):
+        try:
+            event = json.loads("\n".join(data))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("VoxCPM returned invalid SSE event data") from exc
+        if not isinstance(event, dict):
+            raise ValueError("VoxCPM returned a non-object SSE event")
+        return event
+
     event_data = []
-    for raw_line in response.iter_lines(decode_unicode=True):
-        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+    event_bytes = 0
+    first_line = True
+    for line in lines():
+        if first_line:
+            # SSE UTF-8 decoding ignores one BOM at the start of the stream.
+            line = line.removeprefix("\ufeff")
+            first_line = False
         if not line:
             if event_data:
-                try:
-                    yield json.loads("\n".join(event_data))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("VoxCPM returned invalid SSE event data") from exc
+                yield parse_event(event_data)
                 event_data = []
+                event_bytes = 0
             continue
         if line.startswith("data:"):
-            event_data.append(line.removeprefix("data:").strip())
+            data = line.removeprefix("data:").strip()
+            event_bytes += len(data.encode("utf-8")) + 1
+            if event_bytes > _VOXCPM_SSE_MAX_EVENT_BYTES:
+                raise ValueError("VoxCPM SSE event exceeds the size limit")
+            event_data.append(data)
     if event_data:
-        try:
-            yield json.loads("\n".join(event_data))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("VoxCPM returned invalid trailing SSE event data") from exc
+        yield parse_event(event_data)
 
 
 def prepare_voxcpm_reference_audio(uploaded_audio: bytes, suffix: str = "") -> bytes:
@@ -2788,8 +3254,14 @@ def _encode_voxcpm_audio_data_uri(
         raise ValueError(f"{field_name} audio exceeds ModelBest's 5 MiB limit")
     try:
         with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
-            if wav_file.getnframes() <= 0:
+            frame_count = wav_file.getnframes()
+            if frame_count <= 0:
                 raise ValueError(f"{field_name} audio is empty")
+            expected_bytes = frame_count * wav_file.getnchannels() * wav_file.getsampwidth()
+            # WAV headers can advertise frames that are not in the upload.
+            # Bound the read by the existing upload cap even for forged counts.
+            if expected_bytes > len(audio_bytes) or len(wav_file.readframes(frame_count)) != expected_bytes:
+                raise ValueError(f"{field_name} audio contains truncated PCM frames")
     except wave.Error as exc:
         raise ValueError(f"{field_name} audio must be a valid WAV") from exc
     return "data:audio/wav;base64," + base64.b64encode(audio_bytes).decode("ascii")
@@ -2879,13 +3351,20 @@ def voxcpm_tts(
                 f"start VoxCPM TTS, model: {model_id}, voice: {voice_id}, "
                 f"try: {attempt + 1}"
             )
-            response = requests.post(
+            response = trace_http_call(
+                "POST", requests.post,
                 url,
                 json=payload,
                 headers=headers,
+                allow_redirects=False,
                 stream=True,
                 timeout=(10, 120),
             )
+            if 300 <= response.status_code < 400:
+                # Redirecting a speech POST may replay a billed synthesis or
+                # forward its input/credentials. Do not follow or resubmit it.
+                logger.error("TTS endpoint returned a redirect; stop speech retries")
+                return None
             if response.status_code != 200:
                 logger.error(
                     f"VoxCPM TTS failed with status {response.status_code}: "
@@ -2898,6 +3377,7 @@ def voxcpm_tts(
                 continue
 
             audio_chunks = []
+            total_audio_bytes = 0
             completed = False
             for event in _iter_voxcpm_sse_events(response):
                 event_type = event.get("type")
@@ -2906,9 +3386,13 @@ def voxcpm_tts(
                     if not isinstance(encoded_chunk, str) or not encoded_chunk:
                         raise ValueError("VoxCPM returned an empty audio chunk")
                     try:
-                        audio_chunks.append(base64.b64decode(encoded_chunk, validate=True))
+                        chunk = base64.b64decode(encoded_chunk, validate=True)
                     except (ValueError, TypeError) as exc:
                         raise ValueError("VoxCPM returned invalid Base64 audio") from exc
+                    total_audio_bytes += len(chunk)
+                    if total_audio_bytes > _VOXCPM_TTS_MAX_AUDIO_BYTES:
+                        raise ValueError("VoxCPM generated audio exceeds the size limit")
+                    audio_chunks.append(chunk)
                 elif event_type == "speech.audio.done":
                     completed = True
                     break
@@ -3058,18 +3542,20 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
         return ""
 
     target_line = script_lines[sub_index]
-    if current_text == target_line:
+    comparison_target = unicodedata.normalize("NFC", target_line)
+    current_text = unicodedata.normalize("NFC", current_text)
+    if current_text == comparison_target:
         return target_line.strip()
 
     current_text_normalized = re.sub(r"[_\W]+", "", current_text)
-    target_line_normalized = re.sub(r"[_\W]+", "", target_line)
+    target_line_normalized = re.sub(r"[_\W]+", "", comparison_target)
     if current_text_normalized == target_line_normalized:
         return target_line.strip()
 
     # 最后一层阿拉伯语容错：edge-tts 返回的字母形态、变音符号或 Tatweel
     # 可能和脚本不同。只在常规匹配失败后归一化比较，非阿拉伯语文本不会受影响。
     current_ar = re.sub(r"[_\W]+", "", _normalize_arabic(current_text))
-    target_ar = re.sub(r"[_\W]+", "", _normalize_arabic(target_line))
+    target_ar = re.sub(r"[_\W]+", "", _normalize_arabic(comparison_target))
     if current_ar and current_ar == target_ar:
         return target_line.strip()
 
@@ -3077,28 +3563,23 @@ def _match_script_line(script_lines: list[str], current_text: str, sub_index: in
 
 
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
-    """
-    将已经聚合好的字幕段写入到 SRT 文件，并做一次基本可读性验证。
-
-    返回值：
-    - `True`：字幕文件成功落盘且可被 moviepy 解析；
-    - `False`：字幕文件写入或解析失败。
-    """
+    """Publish a complete, parseable SRT without destroying earlier captions."""
     try:
         ensure_file_path_exists(subtitle_file)
-        with open(subtitle_file, "w", encoding="utf-8") as file:
-            file.write("\n".join(sub_items) + "\n")
-
-        sbs = subtitles.file_to_subtitles(subtitle_file, encoding="utf-8")
-        duration = max([tb for ((ta, tb), txt) in sbs]) if sbs else 0
+        with staged_subtitle_file(subtitle_file) as staged:
+            with open(staged, "w", encoding="utf-8") as file:
+                file.write("\n".join(sub_items) + "\n")
+            sbs = moviepy_subtitles(staged)
+            if not sbs:
+                raise ValueError("subtitle output contains no cues")
+            duration = max(tb for ((ta, tb), txt) in sbs)
+            os.replace(staged, subtitle_file)
         logger.info(
             f"completed, subtitle file created: {subtitle_file}, duration: {duration}"
         )
         return True
     except Exception as e:
         logger.error(f"failed, error: {str(e)}")
-        if os.path.exists(subtitle_file):
-            os.remove(subtitle_file)
         return False
 
 
@@ -3255,6 +3736,46 @@ def _build_subtitle_items_from_legacy_submaker_words(sub_maker: SubMaker) -> lis
     return sub_items
 
 
+def _join_lines_split_inside_words(
+    text: str, script_lines: list[str], words: list[str]
+) -> list[str]:
+    """
+    Join each script line that ends inside a TTS word with the line after it.
+
+    Edge TTS returns "July 20, 1969", "Washington, D.C.", "No. 1" and
+    "Am 9. November 1989" as one word each, but the script split ends a line
+    at their comma or full stop. No run of words can match such a line, and
+    without it no subtitle file is written at all. A joined line keeps the
+    script text between its parts, as in "On July 20, 1969". Lines are only
+    joined when the words spell the script exactly, compared as in
+    _match_script_line().
+    """
+
+    def comparable(value: str) -> str:
+        return re.sub(r"[_\W]+", "", unicodedata.normalize("NFC", value))
+
+    word_texts = [comparable(unescape(word)) for word in words]
+    line_texts = [comparable(line) for line in script_lines]
+    if "".join(word_texts) != "".join(line_texts):
+        return script_lines
+
+    word_ends = set(itertools.accumulate(map(len, word_texts)))
+    line_ends = itertools.accumulate(map(len, line_texts))
+    joined_lines = []
+    start = None
+    position = 0
+    for line, line_end in zip(script_lines, line_ends):
+        # Each script line is a part of text, in order.
+        line_start = text.find(line, position)
+        position = line_start + len(line)
+        if start is None:
+            start = line_start
+        if line_end in word_ends:
+            joined_lines.append(text[start:position])
+            start = None
+    return joined_lines
+
+
 def create_subtitle(
     sub_maker: SubMaker,
     text: str,
@@ -3279,10 +3800,23 @@ def create_subtitle(
                 _write_subtitle_items(sub_items, subtitle_file)
                 return
 
-        script_lines = utils.split_string_by_punctuations(text)
+        # 只有符号的行（如 `* * *`、`———`、`• • •` 场景分隔）不会被朗读，
+        # 也不会得到任何词级时间轴；保留它们会让行数永远对不上，整段字幕
+        # 都无法生成。
+        script_lines = [
+            line
+            for line in utils.split_string_by_punctuations(text)
+            if re.sub(r"[_\W]+", "", line)
+        ]
         if hasattr(sub_maker, "cues") and sub_maker.cues:
+            script_lines = _join_lines_split_inside_words(
+                text, script_lines, [cue.content for cue in sub_maker.cues]
+            )
             sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
         else:
+            script_lines = _join_lines_split_inside_words(
+                text, script_lines, getattr(sub_maker, "subs", [])
+            )
             sub_items = _build_subtitle_items_from_legacy_submaker(
                 sub_maker, script_lines
             )

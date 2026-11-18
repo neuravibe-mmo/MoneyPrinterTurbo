@@ -79,9 +79,14 @@ def test_grouped_video_source_keeps_groups_and_accessible_label_binding():
             "[AI Video] OFox AI Video",
             "[AI Video] Shengsuan Cloud AI Video",
             "[AI Video] Volcano Engine Ark · Seedance",
+            "[AI Video] Infistar AI Video",
+            "[AI Video] Jalapeno Cloud AI Video",
             "[AI Video] WaveSpeed AI Video",
             "[AI Video] MuAPI AI Video",
+            "[AI Video] useapi.net AI Video",
             "[AI Image] OpenAI Compatible Text-to-Image",
+            "[AI Image] OpenAI - Codex Images",
+            "[AI Image] useapi.net AI Images (Nano Banana, Kling)",
             "[Local Files] Local file",
         ]
 
